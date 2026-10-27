@@ -1,35 +1,32 @@
 //! ddpm command line interface.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use anyhow::{anyhow, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::ddcci;
-use crate::driver::{monitors, py_round, Monitor, SCALER_CODES};
+use crate::driver::{monitors, py_round, resolve_backend, BackendSel, Monitor, SCALER_CODES};
 use crate::presets::Presets;
 use crate::vcp;
 
-#[derive(ValueEnum, Clone, Debug)]
-pub enum BackendSel {
-    Auto,
-    Ddcutil,
-    Ddcci,
-    Mock,
+/// An error that also sets the process exit status (used for "display not found").
+#[derive(Debug)]
+pub struct ExitError {
+    pub code: i32,
+    pub message: String,
 }
 
-impl BackendSel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            BackendSel::Auto => "auto",
-            BackendSel::Ddcutil => "ddcutil",
-            BackendSel::Ddcci => "ddcci",
-            BackendSel::Mock => "mock",
-        }
+impl fmt::Display for ExitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
+
+impl std::error::Error for ExitError {}
 
 #[derive(Subcommand, Clone, Debug, ValueEnum)]
 enum PresetAction {
@@ -110,67 +107,54 @@ pub struct Cli {
     command: Command,
 }
 
-fn die(msg: &str) -> ! {
-    eprintln!("Error: {}", msg);
-    std::process::exit(1);
+fn backend_selector(cli: &Cli) -> Result<String> {
+    resolve_backend(cli.backend)
 }
 
-fn backend_selector(cli: &Cli) -> String {
-    cli.backend
-        .as_ref()
-        .map(|b| b.as_str().to_string())
-        .or_else(|| {
-            Config::new()
-                .ok()
-                .and_then(|c| c.get("driver").and_then(|v| v.as_str()).map(String::from))
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "auto".to_string())
+fn mons_of(cli: &Cli) -> Result<Vec<Monitor>> {
+    let (_, mons) = monitors(&backend_selector(cli)?)?;
+    Ok(mons)
 }
 
-fn mons_of(cli: &Cli) -> Vec<Monitor> {
-    match monitors(&backend_selector(cli)) {
-        Ok((_, mons)) => mons,
-        Err(e) => die(&e.to_string()),
-    }
-}
-
-fn pick_monitor(ident: &str, mons: &[Monitor], cfg: &Config) -> Monitor {
+fn pick_monitor(ident: &str, mons: &[Monitor], cfg: &Config) -> Result<Monitor> {
     let mapping = cfg.get_map();
     if let Some(target) = mapping.get(ident) {
         let target = target.as_str().unwrap_or("");
         for m in mons {
             if m.uuid() == target || m.serial() == Some(target) {
-                return m.clone();
+                return Ok(m.clone());
             }
         }
-        die(&format!(
+        bail!(
             "{} maps to {}, which is not connected",
             vcp::py_repr(ident),
             vcp::py_repr(target)
-        ));
+        );
     }
     for m in mons {
         // match uuid (== id, the bus), serial, or model name
         if ident == m.uuid() || m.serial() == Some(ident) || ident == m.name() {
-            return m.clone();
+            return Ok(m.clone());
         }
     }
     if let Ok(num) = ident.parse::<usize>() {
         if (1..=mons.len()).contains(&num) {
-            return mons[num - 1].clone();
+            return Ok(mons[num - 1].clone());
         }
     }
     if !mons.is_empty() {
         let names: Vec<&str> = mons.iter().map(|m| m.name()).collect();
-        eprintln!(
-            "Error: display {} not found. Known displays: {}",
-            vcp::py_repr(ident),
-            names.join(", ")
-        );
-        std::process::exit(2);
+        return Err(ExitError {
+            code: 2,
+            message: format!(
+                "display {} not found. Known displays: {}",
+                vcp::py_repr(ident),
+                names.join(", ")
+            ),
+        }
+        .into());
     }
-    die("No displays found. Try 'ddpm detect'.\nTip: sudo apt install ddcutil, and/or run 'sudo modprobe i2c-dev'.");
+    bail!("No displays found. Try 'ddpm detect'.\nTip: sudo apt install ddcutil, and/or run 'sudo modprobe i2c-dev'.");
 }
 
 pub fn fmt_value(code: u8, value: i64) -> String {
@@ -189,9 +173,9 @@ fn parse_pairs(pairs: &[String]) -> Result<Vec<(u8, String)>> {
     let mut out = Vec::new();
     for tok in pairs {
         let Some((f, val)) = tok.split_once('=') else {
-            return Err(anyhow!("expected FEATURE=VALUE, got {}", vcp::py_repr(tok)));
+            bail!("expected FEATURE=VALUE, got {}", vcp::py_repr(tok));
         };
-        let code = vcp::feature_code(f).map_err(|e| anyhow!(e))?;
+        let code = vcp::feature_code(f).map_err(anyhow::Error::msg)?;
         out.push((code, val.to_string()));
     }
     Ok(out)
@@ -200,7 +184,7 @@ fn parse_pairs(pairs: &[String]) -> Result<Vec<(u8, String)>> {
 fn pairs_to_spec(pairs: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut spec = BTreeMap::new();
     for (code, raw) in parse_pairs(pairs)? {
-        let val = vcp::parse_value(code, &Value::String(raw)).map_err(|e| anyhow!(e))?;
+        let val = vcp::parse_value(code, &Value::String(raw)).map_err(anyhow::Error::msg)?;
         spec.insert(vcp::feature_name(code), Value::from(val));
     }
     Ok(spec)
@@ -230,14 +214,14 @@ pub fn snapshot(mon: &Monitor) -> BTreeMap<String, Value> {
     spec
 }
 
-fn cmd_list(cli: &Cli, verbose: bool) -> i32 {
-    let mons = mons_of(cli);
+fn cmd_list(cli: &Cli, verbose: bool) -> Result<i32> {
+    let mons = mons_of(cli)?;
     if mons.is_empty() {
         println!("No displays found.");
         println!("Try: sudo apt install ddcutil ; sudo modprobe i2c-dev");
-        return 1;
+        return Ok(1);
     }
-    let sel = backend_selector(cli);
+    let sel = backend_selector(cli)?;
     println!("Displays: {} (backend: {})", mons.len(), sel);
     for (i, m) in mons.iter().enumerate() {
         let serial = match m.serial() {
@@ -252,21 +236,15 @@ fn cmd_list(cli: &Cli, verbose: bool) -> i32 {
             serial
         );
         if verbose {
-            match m.caps().first() {
-                Some(_) => {
-                    let caps: Vec<String> =
-                        m.caps().iter().map(|&c| vcp::feature_name(c)).collect();
-                    println!("     features: {}", caps.join(", "));
-                }
-                None => println!("     features:"),
-            }
+            let caps: Vec<String> = m.caps().iter().map(|&c| vcp::feature_name(c)).collect();
+            println!("     features: {}", caps.join(", "));
         }
     }
-    0
+    Ok(0)
 }
 
-fn cmd_detect(cli: &Cli) -> i32 {
-    if backend_selector(cli) == "ddcutil" {
+fn cmd_detect(cli: &Cli) -> Result<i32> {
+    if backend_selector(cli)? == "ddcutil" {
         return cmd_list(cli, false);
     }
     let mut found = false;
@@ -289,18 +267,15 @@ fn cmd_detect(cli: &Cli) -> i32 {
     if !found {
         println!("No displays detected on /dev/i2c-*.");
         println!("Check: ls /dev/i2c-*   and   sudo modprobe i2c-dev");
-        return 1;
+        return Ok(1);
     }
-    0
+    Ok(0)
 }
 
-fn cmd_get(cli: &Cli, display: &str, features: &[String]) -> i32 {
-    let cfg = match Config::new() {
-        Ok(c) => c,
-        Err(e) => die(&e.to_string()),
-    };
-    let mons = mons_of(cli);
-    let mon = pick_monitor(display, &mons, &cfg);
+fn cmd_get(cli: &Cli, display: &str, features: &[String]) -> Result<i32> {
+    let cfg = Config::new()?;
+    let mons = mons_of(cli)?;
+    let mon = pick_monitor(display, &mons, &cfg)?;
     let mut rc = 0;
     for token in features {
         let code = match vcp::feature_code(token) {
@@ -340,20 +315,14 @@ fn cmd_get(cli: &Cli, display: &str, features: &[String]) -> i32 {
             );
         }
     }
-    rc
+    Ok(rc)
 }
 
-fn cmd_set(cli: &Cli, display: &str, pairs: &[String]) -> i32 {
-    let cfg = match Config::new() {
-        Ok(c) => c,
-        Err(e) => die(&e.to_string()),
-    };
-    let mons = mons_of(cli);
-    let mon = pick_monitor(display, &mons, &cfg);
-    let spec = match pairs_to_spec(pairs) {
-        Ok(spec) => spec,
-        Err(e) => die(&e.to_string()),
-    };
+fn cmd_set(cli: &Cli, display: &str, pairs: &[String]) -> Result<i32> {
+    let cfg = Config::new()?;
+    let mons = mons_of(cli)?;
+    let mon = pick_monitor(display, &mons, &cfg)?;
+    let spec = pairs_to_spec(pairs)?;
     let mut rc = 0;
     for (token, val) in &spec {
         if let Err(e) = mon.set(token, val) {
@@ -361,7 +330,7 @@ fn cmd_set(cli: &Cli, display: &str, pairs: &[String]) -> i32 {
             rc = 1;
         }
     }
-    rc
+    Ok(rc)
 }
 
 /// Compact, Python-json-style rendering: {"a": 1, "b": "x"}
@@ -390,20 +359,14 @@ fn cmd_preset(
     name: &Option<String>,
     pairs: &[String],
     display: &Option<String>,
-) -> i32 {
-    let cfg = match Config::new() {
-        Ok(c) => c,
-        Err(e) => die(&e.to_string()),
-    };
-    let mut ps = match Presets::new() {
-        Ok(ps) => ps,
-        Err(e) => die(&e.to_string()),
-    };
+) -> Result<i32> {
+    let cfg = Config::new()?;
+    let mut ps = Presets::new()?;
     match action {
         PresetAction::List => {
             if ps.names().is_empty() {
                 println!("no presets saved; try: ddpm preset save work");
-                return 0;
+                return Ok(0);
             }
             for name in ps.names() {
                 let spec = &ps.presets[&name];
@@ -412,50 +375,43 @@ fn cmd_preset(
                 ));
                 println!("{:<16} {}", name, spec_json);
             }
-            0
+            Ok(0)
         }
         PresetAction::Rm => {
             let Some(name) = name else {
-                die("preset rm requires a name");
+                bail!("preset rm requires a name");
             };
-            if let Err(e) = ps.delete(name) {
-                die(&e.to_string());
-            }
+            ps.delete(name)?;
             println!("removed preset {}", vcp::py_repr(name));
-            0
+            Ok(0)
         }
         PresetAction::Save => {
             let Some(name) = name else {
-                die("preset save requires a name");
+                bail!("preset save requires a name");
             };
-            let mons = mons_of(cli);
-            let mon = pick_monitor(display.as_deref().unwrap_or("1"), &mons, &cfg);
+            let mons = mons_of(cli)?;
+            let mon = pick_monitor(display.as_deref().unwrap_or("1"), &mons, &cfg)?;
             let spec = if !pairs.is_empty() {
-                match pairs_to_spec(pairs) {
-                    Ok(spec) => spec,
-                    Err(e) => die(&e.to_string()),
-                }
+                pairs_to_spec(pairs)?
             } else {
                 snapshot(&mon)
             };
-            if let Err(e) = ps.set(name, spec.clone()) {
-                die(&e.to_string());
-            }
+            ps.set(name, spec.clone())?;
             let spec_json = py_json(&Value::Object(
                 spec.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             ));
             println!("saved preset {}: {}", vcp::py_repr(name), spec_json);
-            0
+            Ok(0)
         }
         PresetAction::Apply => {
             let Some(name) = name else {
-                die("preset apply requires a name");
+                bail!("preset apply requires a name");
             };
             let Some(spec) = ps.get(name).cloned() else {
-                die(&format!("no preset named {}", vcp::py_repr(name)));
+                bail!("no preset named {}", vcp::py_repr(name));
             };
-            let mons = mons_of(cli);
-            let mon = pick_monitor(display.as_deref().unwrap_or("1"), &mons, &cfg);
+            let mons = mons_of(cli)?;
+            let mon = pick_monitor(display.as_deref().unwrap_or("1"), &mons, &cfg)?;
             let mut rc = 0;
             for (f, val) in &spec {
                 if let Err(e) = mon.set(f, val) {
@@ -463,56 +419,46 @@ fn cmd_preset(
                     rc = 1;
                 }
             }
-            rc
+            Ok(rc)
         }
     }
 }
 
-fn cmd_config(action: &ConfigAction, key: &Option<String>, value: &Option<String>) -> i32 {
-    let mut cfg = match Config::new() {
-        Ok(c) => c,
-        Err(e) => die(&e.to_string()),
-    };
+fn cmd_config(action: &ConfigAction, key: &Option<String>, value: &Option<String>) -> Result<i32> {
+    let mut cfg = Config::new()?;
     match action {
         ConfigAction::Path => {
             println!("{}", cfg.configfile.display());
-            0
+            Ok(0)
         }
         ConfigAction::Get => {
-            let pretty =
-                serde_json::to_string_pretty(&cfg.config).unwrap_or_else(|_| "{}".to_string());
-            println!("{}", pretty);
-            0
+            println!("{}", serde_json::to_string_pretty(&cfg.config)?);
+            Ok(0)
         }
         ConfigAction::Set => {
             let Some(key) = key else {
-                die("config set requires KEY VALUE");
+                bail!("config set requires KEY VALUE");
             };
-            cfg.set(key, Value::String(value.clone().unwrap_or_default()));
-            if let Err(e) = cfg.save() {
-                die(&e.to_string());
-            }
-            println!("set {}={}", key, value.clone().unwrap_or_default());
-            0
+            let value = value.clone().unwrap_or_default();
+            cfg.set(key, Value::String(value.clone()));
+            cfg.save()?;
+            println!("set {}={}", key, value);
+            Ok(0)
         }
         ConfigAction::Unset => {
             let Some(key) = key else {
-                die("config unset requires KEY");
+                bail!("config unset requires KEY");
             };
-            if let Err(e) = cfg.unset(key) {
-                die(&e.to_string());
-            }
-            if let Err(e) = cfg.save() {
-                die(&e.to_string());
-            }
-            0
+            cfg.unset(key)?;
+            cfg.save()?;
+            Ok(0)
         }
     }
 }
 
 pub fn main() -> i32 {
     let cli = Cli::parse();
-    match &cli.command {
+    let result = match &cli.command {
         Command::List { verbose } => cmd_list(&cli, *verbose),
         Command::Detect => cmd_detect(&cli),
         Command::Get { display, features } => cmd_get(&cli, display, features),
@@ -524,5 +470,12 @@ pub fn main() -> i32 {
             display,
         } => cmd_preset(&cli, action, name, pairs, display),
         Command::Config { action, key, value } => cmd_config(action, key, value),
+    };
+    match result {
+        Ok(rc) => rc,
+        Err(err) => {
+            eprintln!("Error: {:#}", err);
+            err.downcast_ref::<ExitError>().map_or(1, |e| e.code)
+        }
     }
 }

@@ -306,3 +306,51 @@ fn test_based_on_config_mock() {
 fn test_bus_open_error_message() {
     assert!(Bus::open("/nonexistent/ddpm-no-such-bus").is_err());
 }
+
+/// A capabilities reply frame as a display would send it, checksum included.
+fn caps_reply(offset: u16, fragment: &[u8]) -> Vec<u8> {
+    let mut frame = vec![
+        0x6Eu8,
+        0x80 | (3 + fragment.len()) as u8,
+        ddcci::OP_CAPS_REPLY,
+        (offset >> 8) as u8,
+        offset as u8,
+    ];
+    frame.extend_from_slice(fragment);
+    let ck = ddcci::xor(&[&[0x50u8], &frame[..]].concat());
+    frame.push(ck);
+    frame
+}
+
+#[test]
+fn test_caps_reply_is_matched_by_offset_and_checksum() {
+    let frame = caps_reply(0, b"vcp(10 12)");
+    assert_eq!(
+        ddcci::find_caps_fragment(&frame, 0),
+        Some(b"vcp(10 12)".to_vec())
+    );
+    assert_eq!(ddcci::find_caps_fragment(&frame, 4), None);
+    let mut bad = frame.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    assert_eq!(ddcci::find_caps_fragment(&bad, 0), None);
+}
+
+#[test]
+fn test_collect_fragments_reassembles_capabilities() {
+    let text = b"(prot(monitor)vcp(10 12 14(05 08))mccs_ver(2.1))".to_vec();
+    let served = text.clone();
+    let got = ddcci::collect_fragments(|offset| {
+        let start = offset as usize;
+        let end = (start + 7).min(served.len());
+        Ok(served.get(start..end).unwrap_or(&[]).to_vec())
+    })
+    .unwrap();
+    assert_eq!(got, text);
+}
+
+#[test]
+fn test_collect_fragments_is_bounded() {
+    let err = ddcci::collect_fragments(|_| Ok(vec![b'x'; 100])).unwrap_err();
+    assert!(err.to_string().contains("longer than"), "{err}");
+}

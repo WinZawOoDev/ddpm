@@ -12,8 +12,8 @@ use std::thread;
 use eframe::egui;
 use serde_json::Value;
 
-use ddpm::config::Config;
-use ddpm::driver::{monitors, Monitor};
+use clap::Parser;
+use ddpm::driver::{monitors, resolve_backend, BackendSel, Monitor};
 use ddpm::presets::Presets;
 use ddpm::vcp;
 
@@ -32,6 +32,15 @@ const MENUS: [(&str, &str, ValueTable); 5] = [
 ];
 
 const NO_DISPLAYS_TEXT: &str = "No DDC/CI displays found.\n\nTry:\n  sudo modprobe i2c-dev\n  sudo apt install ddcutil\n  sudo usermod -aG i2c $USER";
+
+/// Command line options: the same backend choice as the CLI.
+#[derive(Parser)]
+#[command(name = "ddpm-gui", about = "DDC/CI controls for Dell-style displays")]
+struct GuiArgs {
+    /// backend driver: auto (default), ddcutil, direct i2c (ddcci), mock
+    #[arg(long, value_enum, ignore_case = true)]
+    backend: Option<BackendSel>,
+}
 
 type Spec = BTreeMap<String, Value>;
 type ValueTable = &'static [(u16, &'static str)];
@@ -81,16 +90,10 @@ fn name_from_value(code: u8, value: u16) -> Option<String> {
         .map(|(_, name)| name.to_string())
 }
 
-fn configured_driver() -> String {
-    Config::new()
-        .ok()
-        .and_then(|c| c.get("driver").and_then(|v| v.as_str()).map(String::from))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "auto".to_string())
-}
-
 struct App {
     backend_label: String,
+    /// Backend selector used for every reload (from --backend or the config).
+    backend_sel: String,
     tx: Sender<GuiMsg>,
     rx: Receiver<GuiMsg>,
     mons: Vec<Monitor>,
@@ -106,15 +109,15 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(explicit: Option<BackendSel>) -> Self {
         let (tx, rx) = mpsc::channel();
-        // sel = backend arg or Config().get("driver") or "auto" (label only)
-        let backend_label = std::env::args()
-            .nth(1)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(configured_driver);
+        let (backend_sel, backend_error) = match resolve_backend(explicit) {
+            Ok(sel) => (sel, None),
+            Err(e) => ("auto".to_string(), Some(e.to_string())),
+        };
         let mut app = App {
-            backend_label,
+            backend_label: backend_sel.clone(),
+            backend_sel,
             tx,
             rx,
             mons: Vec::new(),
@@ -125,11 +128,13 @@ impl App {
             preset_sel: String::new(),
             save_open: false,
             save_name: String::new(),
-            error: None,
+            error: backend_error,
             info: None,
         };
         app.refresh_presets();
-        app.error = app.presets.as_ref().err().cloned();
+        if app.error.is_none() {
+            app.error = app.presets.as_ref().err().cloned();
+        }
         app.reload();
         app
     }
@@ -146,7 +151,9 @@ impl App {
     }
 
     fn reload(&mut self) {
-        let sel = configured_driver();
+        // Re-read presets too, so changes made by the CLI show up on Refresh.
+        self.presets = Presets::new().map_err(|e| e.to_string());
+        let sel = self.backend_sel.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
             let msg = match monitors(&sel) {
@@ -199,7 +206,7 @@ impl App {
             GuiMsg::Reload(Ok(mons)) => {
                 self.mons = mons;
                 self.panels.clear();
-                self.tab = 0;
+                self.tab = self.tab.min(self.mons.len().saturating_sub(1));
                 for m in &self.mons {
                     self.panels.push(PanelUi::new(m.uuid()));
                     self.refresh_panel(m);
@@ -305,7 +312,13 @@ impl App {
         let Some(mon) = self.current_mon().cloned() else {
             return;
         };
-        let Some(spec) = self.presets.as_ref().ok().and_then(|p| p.get(&name)).cloned() else {
+        let Some(spec) = self
+            .presets
+            .as_ref()
+            .ok()
+            .and_then(|p| p.get(&name))
+            .cloned()
+        else {
             return;
         };
         self.submit(
@@ -539,6 +552,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    let args = GuiArgs::parse();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 320.0])
@@ -548,6 +562,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "DDPM - Dell Display and Peripheral Manager (clone)",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(args.backend)))),
     )
 }

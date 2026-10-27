@@ -6,8 +6,7 @@ Manager (DDPM/DDM)** on Linux. It talks to monitors directly over
 is installed. Dell's DDPM itself is Windows/macOS-only; this project is an
 independent implementation of its most-used feature set.
 
-This is the **Rust** implementation (originally Python; the legacy sources
-are kept in `ddpm/` for reference). Two binaries are built: `ddpm` (CLI) and
+This is the **Rust** implementation. Two binaries are built: `ddpm` (CLI) and
 `ddpm-gui` (eframe/egui window).
 
 ## Features
@@ -17,7 +16,7 @@ are kept in `ddpm/` for reference). Two binaries are built: `ddpm` (CLI) and
 | Enumerate displays (model, serial, bus, features) | `list`, `detect` | yes |
 | Brightness / contrast / volume (0-100) | `get`, `set` | sliders |
 | Input source (vga, dvi, dp, hdmi, usb-c...) | `get`, `set` | dropdown |
-| Power state (on / standby / off), OSD lock, mute | `get`, `set` | dropdown |
+| Power state (on / standby / suspend / off / hard-off), OSD lock/unlock, mute | `get`, `set` | dropdown |
 | Color temperature presets | `get`, `set` | dropdown |
 | Raw VCP codes | `get`/`set 0x62` | - |
 | Named presets (save snapshot, apply later) | `preset` | buttons |
@@ -29,7 +28,8 @@ Build with cargo (Rust 1.80+; install the toolchain with
 [rustup](https://rustup.rs) if needed):
 
 ```bash
-cargo install --path .       # installs ddpm and ddpm-gui to ~/.cargo/bin
+cargo install --path .                        # installs ddpm and ddpm-gui to ~/.cargo/bin
+cargo install --path . --no-default-features  # CLI only, without the GUI (eframe)
 ```
 
 System setup (same as before; needed for the direct-i2c driver and
@@ -73,7 +73,7 @@ serial, or a short-name mapped with `ddpm set` in config.
 ## GUI
 
 ```bash
-ddpm-gui
+ddpm-gui                          # or: ddpm-gui --backend mock
 ```
 
 A tabbed window (eframe/egui): one tab per display, sliders for
@@ -89,6 +89,9 @@ threads so the UI stays responsive.
 - `~/.config/ddpm/config.json` — `driver` (auto|ddcutil|ddcci), monitor
   nicknames, etc.
 - Override the config directory with `DDPM_CONFIG_DIR`.
+- A malformed `presets.json` or `config.json` is reported as an error and is
+  never overwritten. Writes go through a temporary file, so an interrupted
+  save cannot truncate them.
 
 ## Architecture
 
@@ -128,3 +131,6 @@ ddpm --backend mock list
   input switching still works as DDPM does on the video side.
 - If nothing is detected: `ls /dev/i2c-*`, `sudo modprobe i2c-dev`, and
   check the OSD's DDC/CI setting. NVIDIA fully supports i2c-dev these days.
+- `power=standby` sends MCCS standby (0x02). Some monitors do not accept it
+  and report "not supported". `power=hard-off` sends the write-only 0x05
+  command, which switches the display off the way its power button does.

@@ -1,15 +1,14 @@
 //! Pure-Rust DDC/CI over /dev/i2c-* (no ddcutil dependency).
 //!
-//! Packet layout (data bytes on the wire after selecting slave 0x37):
+//! Host messages go to slave 0x37 as [0x51, len|0x80, body..., checksum], where
+//! checksum = XOR(0x6E, all previous bytes) and len counts the body bytes.
 //!
-//! Write: [0x51, len|0x80, opcode, <args>, checksum]
-//!   where len counts opcode+args, checksum = XOR(0x6E, all previous bytes).
+//! Display replies are [0x6E, len|0x80, payload..., checksum], where
+//! checksum = XOR(0x50, all previous bytes) and len counts the payload bytes.
 //!
-//! Reply: [0x6E, len|0x80, 0x02, result, vcp, type, MH, ML, SH, SL, checksum]
-//!   validated by XOR(all bytes) == 0x50, i.e. ck = XOR(0x50, previous bytes).
-//!
-//! GET_VCP reply: result, vcp, type, MH, ML, SH, SL  -> len byte = 0x88.
-//! SET_VCP write: opcode 0x03, vcp, SH, SL           -> len byte = 0x84.
+//! - GET_VCP:      body 01 vcp;          reply payload 02 result vcp type MH ML SH SL.
+//! - SET_VCP:      body 03 vcp SH SL;    no reply.
+//! - Capabilities: body F3 offH offL;    reply payload E3 offH offL fragment.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -19,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::driver::{DisplayInfo, VcpFrame};
+use crate::driver::{bus_lock, Backend, DisplayInfo, VcpFrame};
 
 const I2C_SLAVE: libc::c_ulong = 0x0703;
 pub const DDC_ADDR: u16 = 0x37;
@@ -27,6 +26,8 @@ pub const EDID_ADDR: u16 = 0x50;
 pub const OP_GET_VCP: u8 = 0x01;
 pub const OP_REPLY: u8 = 0x02;
 pub const OP_SET_VCP: u8 = 0x03;
+pub const OP_CAPS_REQUEST: u8 = 0xF3;
+pub const OP_CAPS_REPLY: u8 = 0xE3;
 
 pub const RESULT_OK: u8 = 0x00;
 pub const RESULT_UNSUPPORTED: u8 = 0x01;
@@ -34,6 +35,17 @@ pub const RESULT_RETRY: u8 = 0x02;
 pub const RESULT_BROKEN: u8 = 0x03;
 
 pub const DEFAULT_GLOB: &str = "/dev/i2c-*";
+
+/// Attempts per DDC/CI operation before giving up.
+const ATTEMPTS: usize = 3;
+/// Pause after a command and between attempts. DDC/CI wants about 40 ms
+/// between messages.
+const GAP: Duration = Duration::from_millis(50);
+/// How long to wait for the reply to one request.
+const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Upper bound on the capabilities string, so a misbehaving display cannot
+/// keep us reading forever.
+const MAX_CAPS_LEN: usize = 16 * 1024;
 
 pub fn xor(data: &[u8]) -> u8 {
     let mut c = 0u8;
@@ -43,17 +55,9 @@ pub fn xor(data: &[u8]) -> u8 {
     c
 }
 
-/// DDC/CI write-path checksum: XOR with virtual start byte 0x6E.
+/// DDC/CI write-path checksum: XOR with the virtual start byte 0x6E.
 pub fn checksum(data: &[u8]) -> u8 {
     xor(&[&[0x6Eu8], data].concat())
-}
-
-/// raw starts at 0x6E and ends with the checksum byte.
-pub fn valid_reply_checksum(raw: &[u8]) -> bool {
-    if raw.is_empty() {
-        return false;
-    }
-    xor(&[&[0x50u8], &raw[..raw.len() - 1]].concat()) == raw[raw.len() - 1]
 }
 
 /// A parsed GET_VCP reply frame.
@@ -115,29 +119,94 @@ impl Bus {
         Ok(edid)
     }
 
-    /// Send a DDC/CI command and scan the reply stream for a valid frame.
-    pub fn transaction(&self, data: &[u8], want_vcp: u8) -> Result<Frame> {
-        let mut payload = vec![0x51u8, ((data.len() as u8) & 0x7F) | 0x80];
-        payload.extend_from_slice(data);
+    /// Send a host command body and do not wait for a reply (SET_VCP has none).
+    pub fn write_command(&self, body: &[u8]) -> Result<()> {
+        let mut payload = vec![0x51u8, ((body.len() as u8) & 0x7F) | 0x80];
+        payload.extend_from_slice(body);
         payload.push(checksum(&payload));
         self.select(DDC_ADDR)?;
-        self.write_bytes(&payload)?;
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        let mut buf = [0u8; 128];
+        self.write_bytes(&payload)
+    }
+
+    /// Send a command, then poll the bus until `find` recognizes the reply.
+    fn request<T>(&self, body: &[u8], find: impl Fn(&[u8]) -> Option<T>) -> Result<T> {
+        self.write_command(body)?;
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        let mut buf = [0u8; 256];
         while Instant::now() < deadline {
             sleep(Duration::from_millis(30));
             match (&self.file).read(&mut buf) {
-                Err(_) => continue,
-                Ok(0) => continue,
-                Ok(_) => {
-                    if let Some(frame) = find_frame(&buf, want_vcp) {
-                        return Ok(frame);
+                Ok(n) if n > 0 => {
+                    if let Some(found) = find(&buf[..n]) {
+                        return Ok(found);
                     }
                 }
+                _ => {}
             }
         }
         bail!("no valid DDC/CI reply from {}", self.path);
     }
+
+    /// GET_VCP round trip: the reply frame for `want_vcp`.
+    pub fn transaction(&self, data: &[u8], want_vcp: u8) -> Result<Frame> {
+        self.request(data, |raw| find_frame(raw, want_vcp))
+    }
+
+    /// Fetch one capabilities fragment starting at `offset`.
+    fn capabilities_fragment(&self, offset: u16) -> Result<Vec<u8>> {
+        let body = [OP_CAPS_REQUEST, (offset >> 8) as u8, offset as u8];
+        self.request(&body, |raw| find_caps_fragment(raw, offset))
+    }
+
+    /// Read the whole capabilities string, e.g. `(prot(monitor)vcp(10 12)...)`.
+    pub fn read_capabilities(&self) -> Result<String> {
+        let bytes = collect_fragments(|offset| self.capabilities_fragment(offset))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Reassemble a capabilities string. `fetch(offset)` returns the bytes at that
+/// offset, and an empty fragment marks the end.
+pub fn collect_fragments(mut fetch: impl FnMut(u16) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let offset = u16::try_from(out.len()).map_err(|_| anyhow!("capabilities too long"))?;
+        let fragment = fetch(offset)?;
+        if fragment.is_empty() {
+            return Ok(out);
+        }
+        out.extend_from_slice(&fragment);
+        if out.len() > MAX_CAPS_LEN {
+            bail!("capabilities string longer than {} bytes", MAX_CAPS_LEN);
+        }
+    }
+}
+
+/// Find a capabilities reply for `offset` in a raw read buffer and return its
+/// fragment bytes.
+pub fn find_caps_fragment(raw: &[u8], offset: u16) -> Option<Vec<u8>> {
+    for (idx, &byte) in raw.iter().enumerate() {
+        if byte != 0x6E {
+            continue;
+        }
+        let buf = &raw[idx..];
+        if buf.len() < 2 {
+            continue;
+        }
+        let len = (buf[1] & 0x7F) as usize;
+        let end = 2 + len; // index of the checksum byte
+        if len < 3 || buf.len() <= end {
+            continue;
+        }
+        if xor(&[&[0x50u8], &buf[..end]].concat()) != buf[end] {
+            continue;
+        }
+        if buf[2] != OP_CAPS_REPLY || u16::from_be_bytes([buf[3], buf[4]]) != offset {
+            continue;
+        }
+        return Some(buf[5..end].to_vec());
+    }
+    None
 }
 
 /// Scan a read buffer for a valid GET_VCP reply frame.
@@ -245,15 +314,7 @@ pub fn probe_display(path: &str) -> Option<Probe> {
         return None;
     }
     let id = edid_identity(&edid);
-    let mut ddcci = false;
-    if bus.select(DDC_ADDR).is_ok() {
-        let probe = [0x51u8, 0x02 | 0x80, OP_GET_VCP, 0x10];
-        let mut payload = probe.to_vec();
-        payload.push(checksum(&probe));
-        if bus.write_bytes(&payload).is_ok() {
-            ddcci = true;
-        }
-    }
+    let ddcci = bus.write_command(&[OP_GET_VCP, 0x10]).is_ok();
     Some(Probe {
         info: DisplayInfo {
             bus: Some(path.to_string()),
@@ -266,7 +327,7 @@ pub fn probe_display(path: &str) -> Option<Probe> {
     })
 }
 
-/// Yield identities for each i2c bus that answers as a display.
+/// Identities for each i2c bus that answers as a display.
 pub fn scan_buses(bus_glob: &str) -> Vec<Probe> {
     let mut paths: Vec<String> = match glob::glob(bus_glob) {
         Ok(paths) => paths
@@ -278,6 +339,8 @@ pub fn scan_buses(bus_glob: &str) -> Vec<Probe> {
     paths.sort();
     let mut out = Vec::new();
     for path in paths {
+        // Bus 0 is skipped: on most machines it is the chipset SMBus, not a
+        // monitor's DDC/CI bus.
         match path.rsplit('-').next().and_then(|s| s.parse::<i64>().ok()) {
             Some(0) | None => continue,
             _ => {}
@@ -308,12 +371,20 @@ impl DDCCIDriver {
     }
 }
 
-impl crate::driver::Backend for DDCCIDriver {
+fn bus_path(display: &DisplayInfo) -> Result<&str> {
+    display
+        .bus
+        .as_deref()
+        .ok_or_else(|| anyhow!("display has no i2c bus"))
+}
+
+impl Backend for DDCCIDriver {
     fn name(&self) -> &'static str {
         "ddcci"
     }
 
     fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
+        let _guard = bus_lock();
         Ok(scan_buses(&self.bus_glob)
             .into_iter()
             .filter(|p| p.ddcci)
@@ -321,50 +392,64 @@ impl crate::driver::Backend for DDCCIDriver {
             .collect())
     }
 
-    fn capabilities(&self, _display: &DisplayInfo) -> Option<Vec<u8>> {
-        None
+    fn capabilities(&self, display: &DisplayInfo) -> Option<Vec<u8>> {
+        let _guard = bus_lock();
+        let bus = Bus::open(display.bus.as_deref()?).ok()?;
+        let text = bus.read_capabilities().ok()?;
+        let codes = parse_caps_string(&text);
+        if codes.is_empty() {
+            None
+        } else {
+            Some(codes)
+        }
     }
 
     fn get(&self, display: &DisplayInfo, code: u8) -> Result<VcpFrame> {
-        let path = display
-            .bus
-            .as_deref()
-            .ok_or_else(|| anyhow!("display has no i2c bus"))?;
-        let bus = Bus::open(path)?;
-        bus.select(DDC_ADDR)?;
-        let frame = bus.transaction(&[OP_GET_VCP, code], code)?;
-        sleep(Duration::from_millis(50));
-        if frame.result != RESULT_OK {
-            if frame.result == RESULT_UNSUPPORTED {
-                bail!("VCP 0x{:02X} not supported by display", code);
+        let _guard = bus_lock();
+        let bus = Bus::open(bus_path(display)?)?;
+        let mut last_error = None;
+        for _ in 0..ATTEMPTS {
+            match bus.transaction(&[OP_GET_VCP, code], code) {
+                Ok(frame) if frame.result == RESULT_OK => {
+                    sleep(GAP);
+                    return Ok(VcpFrame {
+                        result: frame.result,
+                        code: frame.code,
+                        max: Some(frame.max),
+                        value: Some(frame.value),
+                    });
+                }
+                // The display answered "unsupported": retrying cannot help.
+                Ok(frame) if frame.result == RESULT_UNSUPPORTED => {
+                    bail!("VCP 0x{:02X} not supported by display", code);
+                }
+                Ok(frame) => {
+                    last_error = Some(anyhow!("VCP 0x{:02X} result code {}", code, frame.result));
+                }
+                Err(err) => last_error = Some(err),
             }
-            bail!("VCP 0x{:02X} result code {}", code, frame.result);
+            sleep(GAP);
         }
-        Ok(VcpFrame {
-            result: frame.result,
-            code: frame.code,
-            max: Some(frame.max),
-            value: Some(frame.value),
-        })
+        Err(last_error.unwrap_or_else(|| anyhow!("no reply for VCP 0x{:02X}", code)))
     }
 
     fn set(&self, display: &DisplayInfo, code: u8, value: u16) -> Result<()> {
-        let path = display
-            .bus
-            .as_deref()
-            .ok_or_else(|| anyhow!("display has no i2c bus"))?;
-        // Monitors do not send a useful reply for SET_VCP; write and wait.
-        let bus = Bus::open(path)?;
-        bus.select(DDC_ADDR)?;
-        let data = [OP_SET_VCP, code, (value >> 8) as u8, (value & 0xFF) as u8];
-        let mut payload = vec![0x51u8, ((data.len() as u8) & 0x7F) | 0x80];
-        payload.extend_from_slice(&data);
-        payload.push(checksum(&payload));
-        bus.select(DDC_ADDR)?;
-        bus.write_bytes(&payload)?;
-        drop(bus);
-        sleep(Duration::from_millis(250));
-        Ok(())
+        let _guard = bus_lock();
+        let bus = Bus::open(bus_path(display)?)?;
+        let body = [OP_SET_VCP, code, (value >> 8) as u8, value as u8];
+        let mut last_error = None;
+        for _ in 0..ATTEMPTS {
+            match bus.write_command(&body) {
+                Ok(()) => {
+                    // SET_VCP has no reply; give the display time to act.
+                    sleep(Duration::from_millis(250));
+                    return Ok(());
+                }
+                Err(err) => last_error = Some(err),
+            }
+            sleep(GAP);
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("write of VCP 0x{:02X} failed", code)))
     }
 }
 

@@ -10,6 +10,9 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   exit 1
 fi
 
+# Run from the repository root, wherever the script was started from.
+cd "$(dirname "$0")"
+
 apt-get update
 apt-get install -y ddcutil i2c-tools
 

@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::config::Config;
 use crate::ddcci::{self, DDCCIDriver};
 use crate::vcp;
 
@@ -41,6 +43,48 @@ pub trait Backend: Send + Sync {
     fn capabilities(&self, display: &DisplayInfo) -> Option<Vec<u8>>;
     fn get(&self, display: &DisplayInfo, code: u8) -> Result<VcpFrame>;
     fn set(&self, display: &DisplayInfo, code: u8, value: u16) -> Result<()>;
+}
+
+/// Backend choice from the command line or the config `driver` key.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BackendSel {
+    Auto,
+    Ddcutil,
+    Ddcci,
+    Mock,
+}
+
+impl BackendSel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendSel::Auto => "auto",
+            BackendSel::Ddcutil => "ddcutil",
+            BackendSel::Ddcci => "ddcci",
+            BackendSel::Mock => "mock",
+        }
+    }
+}
+
+/// The backend selector: an explicit choice, else the config `driver` key, else "auto".
+pub fn resolve_backend(explicit: Option<BackendSel>) -> Result<String> {
+    if let Some(choice) = explicit {
+        return Ok(choice.as_str().to_string());
+    }
+    let cfg = Config::new()?;
+    let selector = cfg
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto");
+    Ok(selector.to_string())
+}
+
+/// One lock for all DDC/CI traffic in this process. Backends are rebuilt on
+/// every reload, so a lock owned by one backend would not serialize them.
+pub fn bus_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Python's round(): ties round half to even.
@@ -175,10 +219,6 @@ impl Monitor {
         }
     }
 
-    pub fn set_scaled(&self, feature: &str, percent: i64) -> Result<()> {
-        self.set(feature, &Value::from(percent))
-    }
-
     /// Read (or set, when `value` is given) the brightness percentage.
     pub fn brightness(&self, value: Option<i64>) -> Option<u16> {
         match value {
@@ -267,14 +307,12 @@ fn busno(display: &DisplayInfo) -> Option<u64> {
 
 pub struct DdcutilBackend {
     bin: PathBuf,
-    lock: Mutex<()>,
 }
 
 impl DdcutilBackend {
     pub fn new() -> Self {
         DdcutilBackend {
             bin: which("ddcutil").unwrap_or_else(|| PathBuf::from("ddcutil")),
-            lock: Mutex::new(()),
         }
     }
 
@@ -295,6 +333,7 @@ impl Backend for DdcutilBackend {
     }
 
     fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
+        let _guard = bus_lock();
         let out = run(
             Command::new(&self.bin).arg("detect").arg("--terse"),
             Duration::from_secs(15),
@@ -349,6 +388,7 @@ impl Backend for DdcutilBackend {
     }
 
     fn capabilities(&self, display: &DisplayInfo) -> Option<Vec<u8>> {
+        let _guard = bus_lock();
         let out = run(
             Command::new(&self.bin)
                 .arg("--bus")
@@ -370,7 +410,7 @@ impl Backend for DdcutilBackend {
     }
 
     fn get(&self, display: &DisplayInfo, code: u8) -> Result<VcpFrame> {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = bus_lock();
         let out = run(
             Command::new(&self.bin)
                 .arg("--bus")
@@ -399,7 +439,7 @@ impl Backend for DdcutilBackend {
     }
 
     fn set(&self, display: &DisplayInfo, code: u8, value: u16) -> Result<()> {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = bus_lock();
         run(
             Command::new(&self.bin)
                 .arg("--bus")
@@ -519,25 +559,26 @@ impl Backend for MockBackend {
     }
 }
 
-/// Pick a backend: explicit selector, or ddcutil if installed, else ddcci.
+/// Build a backend from a selector: "mock", "ddcci" (alias "i2c"), "ddcutil",
+/// or "auto" (ddcutil when installed, otherwise ddcci). Unknown names are errors.
 pub fn based_on_config(selector: &str) -> Result<Arc<dyn Backend>> {
-    let selector = selector.trim().to_lowercase();
-    if selector == "mock" || selector == "test" {
-        return Ok(Arc::new(MockBackend::new()));
-    }
-    if selector == "ddcci" || selector == "i2c" {
-        return Ok(Arc::new(DDCCIDriver::new()));
-    }
-    if selector == "ddcutil" {
-        if !DdcutilBackend::available() {
-            bail!("ddcutil binary not found on PATH");
+    match selector.trim().to_lowercase().as_str() {
+        "mock" | "test" => Ok(Arc::new(MockBackend::new())),
+        "ddcci" | "i2c" => Ok(Arc::new(DDCCIDriver::new())),
+        "ddcutil" => {
+            if !DdcutilBackend::available() {
+                bail!("ddcutil binary not found on PATH");
+            }
+            Ok(Arc::new(DdcutilBackend::new()))
         }
-        return Ok(Arc::new(DdcutilBackend::new()));
-    }
-    if DdcutilBackend::available() {
-        Ok(Arc::new(DdcutilBackend::new()))
-    } else {
-        Ok(Arc::new(DDCCIDriver::new()))
+        "" | "auto" => {
+            if DdcutilBackend::available() {
+                Ok(Arc::new(DdcutilBackend::new()))
+            } else {
+                Ok(Arc::new(DDCCIDriver::new()))
+            }
+        }
+        other => bail!("unknown backend {other:?}; expected auto, ddcutil, ddcci or mock"),
     }
 }
 
@@ -579,5 +620,15 @@ mod tests {
     fn run_enforces_timeout() {
         let err = run(Command::new("sleep").arg("5"), Duration::from_millis(200)).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn unknown_backend_names_are_errors() {
+        assert!(based_on_config("banana").is_err());
+    }
+
+    #[test]
+    fn explicit_backend_wins_without_reading_config() {
+        assert_eq!(resolve_backend(Some(BackendSel::Mock)).unwrap(), "mock");
     }
 }
