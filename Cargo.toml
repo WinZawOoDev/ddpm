@@ -3,7 +3,6 @@ name = "ddpm"
 version = "0.1.0"
 edition = "2021"
 description = "Dell Display and Peripheral Manager (DDPM) clone for Ubuntu"
-license = "MIT"
 
 [lib]
 name = "ddpm"

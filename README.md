@@ -134,3 +134,8 @@ ddpm --backend mock list
 - `power=standby` sends MCCS standby (0x02). Some monitors do not accept it
   and report "not supported". `power=hard-off` sends the write-only 0x05
   command, which switches the display off the way its power button does.
+
+## License
+
+Not licensed. No license is granted to use, copy, modify, or distribute this
+software.
