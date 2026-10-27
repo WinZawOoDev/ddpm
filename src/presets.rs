@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::config::config_dir;
+use crate::config::{config_dir, write_atomic};
 use crate::vcp;
 
 pub fn presets_path() -> PathBuf {
@@ -14,10 +14,9 @@ pub fn presets_path() -> PathBuf {
 }
 
 pub fn validate_spec(spec: &BTreeMap<String, Value>) -> Result<()> {
-    // Raise for unknown feature/value tokens in spec dict.
     for (feature, value) in spec {
-        let code = vcp::feature_code(feature).map_err(|e| anyhow!(e))?;
-        vcp::parse_value(code, value).map_err(|e| anyhow!(e))?;
+        let code = vcp::feature_code(feature).map_err(anyhow::Error::msg)?;
+        vcp::parse_value(code, value).map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -27,42 +26,32 @@ pub struct Presets {
     pub presets: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
-impl Default for Presets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Presets {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::with_path(presets_path())
     }
 
-    pub fn with_path(path: PathBuf) -> Self {
-        let mut p = Presets {
-            path,
-            presets: BTreeMap::new(),
-        };
-        p.load();
-        p
-    }
-
-    pub fn load(&mut self) {
-        let Ok(data) = std::fs::read_to_string(&self.path) else {
-            return;
-        };
-        match serde_json::from_str(&data) {
-            Ok(presets) => self.presets = presets,
-            Err(_) => self.presets = BTreeMap::new(),
-        }
+    /// Load the store. A missing file means no presets. A file that exists but
+    /// cannot be parsed is an error, so a later save cannot silently replace it.
+    pub fn with_path(path: PathBuf) -> Result<Self> {
+        let presets: BTreeMap<String, BTreeMap<String, Value>> =
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str(&text).with_context(|| {
+                    format!(
+                        "{} is not valid preset JSON; fix or move it aside",
+                        path.display()
+                    )
+                })?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(err) => {
+                    return Err(err).with_context(|| format!("could not read {}", path.display()))
+                }
+            };
+        Ok(Presets { path, presets })
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.path, serde_json::to_string_pretty(&self.presets)?)?;
-        Ok(())
+        write_atomic(&self.path, &serde_json::to_string_pretty(&self.presets)?)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -81,7 +70,7 @@ impl Presets {
 
     pub fn delete(&mut self, name: &str) -> Result<()> {
         if self.presets.remove(name).is_none() {
-            anyhow::bail!("no preset named {}", vcp::py_repr(name));
+            bail!("no preset named {}", vcp::py_repr(name));
         }
         self.save()
     }

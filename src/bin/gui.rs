@@ -96,7 +96,7 @@ struct App {
     mons: Vec<Monitor>,
     panels: Vec<PanelUi>,
     tab: usize,
-    presets: Presets,
+    presets: Result<Presets, String>,
     preset_names: Vec<String>,
     preset_sel: String,
     save_open: bool,
@@ -120,7 +120,7 @@ impl App {
             mons: Vec::new(),
             panels: Vec::new(),
             tab: 0,
-            presets: Presets::new(),
+            presets: Presets::new().map_err(|e| e.to_string()),
             preset_names: Vec::new(),
             preset_sel: String::new(),
             save_open: false,
@@ -129,6 +129,7 @@ impl App {
             info: None,
         };
         app.refresh_presets();
+        app.error = app.presets.as_ref().err().cloned();
         app.reload();
         app
     }
@@ -183,7 +184,7 @@ impl App {
     }
 
     fn refresh_presets(&mut self) {
-        self.preset_names = self.presets.names();
+        self.preset_names = self.presets.as_ref().map(|p| p.names()).unwrap_or_default();
         if !self.preset_names.is_empty() && self.preset_sel.is_empty() {
             self.preset_sel = self.preset_names[0].clone();
         }
@@ -231,8 +232,13 @@ impl App {
             GuiMsg::Applied(Err(e)) => self.error = Some(e),
             GuiMsg::Snapshot(name, res) => match res {
                 Ok(spec) => {
-                    if let Err(e) = self.presets.set(&name, spec) {
-                        self.error = Some(e.to_string());
+                    match self.presets.as_mut() {
+                        Ok(store) => {
+                            if let Err(e) = store.set(&name, spec) {
+                                self.error = Some(e.to_string());
+                            }
+                        }
+                        Err(e) => self.error = Some(e.clone()),
                     }
                     self.refresh_presets();
                 }
@@ -299,7 +305,7 @@ impl App {
         let Some(mon) = self.current_mon().cloned() else {
             return;
         };
-        let Some(spec) = self.presets.get(&name).cloned() else {
+        let Some(spec) = self.presets.as_ref().ok().and_then(|p| p.get(&name)).cloned() else {
             return;
         };
         self.submit(
@@ -318,8 +324,13 @@ impl App {
         if name.is_empty() {
             return;
         }
-        if let Err(e) = self.presets.delete(&name) {
-            self.error = Some(e.to_string());
+        match self.presets.as_mut() {
+            Ok(store) => {
+                if let Err(e) = store.delete(&name) {
+                    self.error = Some(e.to_string());
+                }
+            }
+            Err(e) => self.error = Some(e.clone()),
         }
         self.refresh_presets();
     }

@@ -395,7 +395,10 @@ fn cmd_preset(
         Ok(c) => c,
         Err(e) => die(&e.to_string()),
     };
-    let mut ps = Presets::new();
+    let mut ps = match Presets::new() {
+        Ok(ps) => ps,
+        Err(e) => die(&e.to_string()),
+    };
     match action {
         PresetAction::List => {
             if ps.names().is_empty() {

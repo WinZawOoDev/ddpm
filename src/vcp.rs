@@ -25,22 +25,32 @@ pub const FEATURE_CODES: &[(&str, u8)] = &[
     ("power", CODE_POWER),
 ];
 
-pub const POWER_VALUES: &[(u16, &str)] = &[(0x01, "on"), (0x04, "off"), (0x05, "standby")];
+/// MCCS 0xD6 (power mode). 0x05 is write-only: it switches the display off
+/// the way the power button does, and reads never report it, so it is named
+/// "hard-off".
+pub const POWER_VALUES: &[(u16, &str)] = &[
+    (0x01, "on"),
+    (0x02, "standby"),
+    (0x03, "suspend"),
+    (0x04, "off"),
+    (0x05, "hard-off"),
+];
 
+/// MCCS 0x14 (select color preset).
 pub const COLOR_PRESET_VALUES: &[(u16, &str)] = &[
-    (0x00, "auto"),
     (0x01, "srgb"),
-    (0x02, "6500k"),
-    (0x03, "7500k"),
-    (0x04, "8200k"),
-    (0x05, "9300k"),
-    (0x06, "10000k"),
-    (0x07, "user1"),
-    (0x08, "user2"),
-    (0x09, "user3"),
-    (0x13, "5000k"),
-    (0x14, "4000k"),
-    (0xA0, "factory"),
+    (0x02, "native"),
+    (0x03, "4000k"),
+    (0x04, "5000k"),
+    (0x05, "6500k"),
+    (0x06, "7500k"),
+    (0x07, "8200k"),
+    (0x08, "9300k"),
+    (0x09, "10000k"),
+    (0x0A, "11500k"),
+    (0x0B, "user1"),
+    (0x0C, "user2"),
+    (0x0D, "user3"),
 ];
 
 pub const INPUT_VALUES: &[(u16, &str)] = &[
@@ -62,7 +72,9 @@ pub const INPUT_VALUES: &[(u16, &str)] = &[
 ];
 
 pub const MUTE_VALUES: &[(u16, &str)] = &[(0x01, "unmute"), (0x02, "mute")];
-pub const OSD_VALUES: &[(u16, &str)] = &[(0x01, "unlock"), (0x02, "lock")];
+
+/// MCCS 0xCA (OSD / button control): 0x01 disables the OSD, which is "lock".
+pub const OSD_VALUES: &[(u16, &str)] = &[(0x01, "lock"), (0x02, "unlock")];
 
 /// VCP codes iterated when snapshotting a display (keys of the Python
 /// VALUE_MAPS dict, in order). Mapped codes carry a value table; the scaler
@@ -97,6 +109,11 @@ pub fn max_default(code: u8) -> Option<u16> {
         CODE_BRIGHTNESS | CODE_CONTRAST | CODE_VOLUME => Some(100),
         _ => None,
     }
+}
+
+/// Scaler features take percentages (0-100) on the command line and in presets.
+pub fn is_percent(code: u8) -> bool {
+    matches!(code, CODE_BRIGHTNESS | CODE_CONTRAST | CODE_VOLUME)
 }
 
 pub fn normalize(s: &str) -> String {
@@ -163,35 +180,61 @@ fn parse_value_error(token: &Value, code: u8) -> String {
     )
 }
 
-/// Resolve a value token (symbolic name, decimal or hex string, or integer)
-/// to a numeric VCP value.
-pub fn parse_value(code: u8, token: &Value) -> Result<i64, String> {
-    if let Some(n) = token.as_i64() {
-        return Ok(n);
-    }
-    let raw = match token.as_str() {
-        Some(s) => s,
-        None => return Err(parse_value_error(token, code)),
+/// Strict integer: an optional '-', then decimal digits or 0x-prefixed hex.
+/// Unlike `normalize`, this never drops characters, so "-5" stays negative.
+fn parse_int(s: &str) -> Option<i64> {
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
     };
-    let norm = normalize(raw);
-    if let Some(hex) = norm.strip_prefix("0x") {
-        return u32::from_str_radix(hex, 16)
-            .map(|v| v as i64)
-            .map_err(|_| parse_value_error(token, code));
-    }
-    if !norm.is_empty() && norm.chars().all(|c| c.is_ascii_digit()) {
-        return norm
-            .parse::<i64>()
-            .map_err(|_| parse_value_error(token, code));
-    }
-    if let Some(mapping) = value_map(code) {
-        for (k, name) in mapping {
-            if normalize(name) == norm {
-                return Ok(*k as i64);
-            }
+    let magnitude = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            i64::from_str_radix(hex, 16).ok()?
         }
+        Some(_) => return None,
+        None if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) => {
+            body.parse::<i64>().ok()?
+        }
+        None => return None,
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// Resolve a value token to a numeric VCP value: an integer (decimal, or hex
+/// with 0x), or a name from the feature's table. Percent features must be 0-100.
+pub fn parse_value(code: u8, token: &Value) -> Result<i64, String> {
+    let number = match token {
+        Value::Number(_) => token.as_i64(),
+        Value::String(raw) => {
+            let raw = raw.trim();
+            parse_int(raw).or_else(|| {
+                let wanted = normalize(raw);
+                value_map(code)?
+                    .iter()
+                    .find(|(_, name)| normalize(name) == wanted)
+                    .map(|(value, _)| i64::from(*value))
+            })
+        }
+        _ => None,
+    };
+    let Some(n) = number else {
+        return Err(parse_value_error(token, code));
+    };
+    let max = if is_percent(code) {
+        100
+    } else {
+        i64::from(u16::MAX)
+    };
+    if (0..=max).contains(&n) {
+        Ok(n)
+    } else {
+        Err(format!(
+            "value {} out of range for {} (0-{})",
+            n,
+            feature_name(code),
+            max
+        ))
     }
-    Err(parse_value_error(token, code))
 }
 
 /// Python-style repr for error messages (single quotes).

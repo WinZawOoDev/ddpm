@@ -368,31 +368,79 @@ impl crate::driver::Backend for DDCCIDriver {
     }
 }
 
-/// Extract the VCP code list from a ddcutil capabilities string like
-/// '(prot(monitor)type(lcd)model(U2415)vcp(04 10 12 60 62 D6 ))'.
+/// Extract the feature codes from a capabilities string such as
+/// `(prot(monitor)type(lcd)vcp(10 12 14(05 06) 60(0F 11) D6(01 04))mccs_ver(2.1))`.
+/// Only codes directly inside `vcp(...)` count; the value lists in parentheses
+/// after a code are skipped.
 pub fn parse_caps_string(caps: &str) -> Vec<u8> {
-    let re = match regex::Regex::new(r"(?i)vcp\(([^)]*)\)") {
-        Ok(re) => re,
-        Err(_) => return Vec::new(),
-    };
-    let Some(m) = re.captures(caps) else {
+    let Some(start) = caps.to_ascii_lowercase().find("vcp(") else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for tok in m[1].split_whitespace() {
-        let tok = tok
-            .split('[')
-            .next()
-            .unwrap_or("")
-            .split('(')
-            .next()
-            .unwrap_or("")
-            .trim();
-        if tok.len() == 2 {
-            if let Ok(v) = u8::from_str_radix(tok, 16) {
-                out.push(v);
+    let mut token = String::new();
+    let mut depth = 1usize; // inside "vcp("
+    for ch in caps[start + 4..].chars() {
+        match ch {
+            '(' => {
+                if depth == 1 {
+                    push_code(&mut out, &token);
+                }
+                token.clear();
+                depth += 1;
+            }
+            ')' if depth == 1 => {
+                push_code(&mut out, &token);
+                token.clear();
+                break;
+            }
+            ')' => {
+                token.clear();
+                depth -= 1;
+            }
+            c if c.is_whitespace() => {
+                if depth == 1 {
+                    push_code(&mut out, &token);
+                }
+                token.clear();
+            }
+            c => {
+                if depth == 1 {
+                    token.push(c);
+                }
             }
         }
     }
+    push_code(&mut out, &token);
+    out.sort_unstable();
+    out.dedup();
     out
+}
+
+/// Extract feature codes from ddcutil's `capabilities` report, which lists one
+/// feature per line, e.g. `Feature: 10 (Brightness)`.
+pub fn parse_feature_lines(report: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in report.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("Feature:") else {
+            continue;
+        };
+        let token = rest
+            .trim_start()
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next()
+            .unwrap_or("");
+        push_code(&mut out, token);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Append `token` as a feature code if it is exactly two hex digits.
+fn push_code(out: &mut Vec<u8>, token: &str) {
+    if token.len() == 2 {
+        if let Ok(code) = u8::from_str_radix(token, 16) {
+            out.push(code);
+        }
+    }
 }

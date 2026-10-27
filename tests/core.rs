@@ -1,18 +1,18 @@
-//! Port of tests/test_core.py (pytest suite, no hardware required).
+//! Integration tests for the ddpm library. No hardware is required.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use ddpm::ddcci::{self, Bus, OP_GET_VCP};
+use ddpm::ddcci::{self, Bus};
 use ddpm::driver::{based_on_config, MockBackend, Monitor};
 use ddpm::presets::Presets;
 use ddpm::vcp;
 use serde_json::{json, Value};
 
 /// Serialize tests that share the mock backend's global state (cargo runs
-/// test threads in parallel; pytest ran sequentially).
+/// test threads in parallel).
 fn mock_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let lock = LOCK.get_or_init(|| Mutex::new(()));
@@ -45,8 +45,6 @@ fn mon() -> Monitor {
 fn spec_of(value: Value) -> BTreeMap<String, Value> {
     serde_json::from_value(value).unwrap()
 }
-
-// --- helpers ported from the Python test suite ---
 
 fn synth_edid(name: &str, serial: Option<&str>) -> Vec<u8> {
     let mut edid = vec![0u8; 128];
@@ -98,10 +96,50 @@ fn test_vcp_parse_values() {
 }
 
 #[test]
-fn test_checksum_roundtrip() {
-    let data = vec![0x51u8, 0x82, 0x01, 0x10];
-    let rev: Vec<u8> = data.iter().rev().copied().collect();
-    assert_eq!(ddcci::checksum(&data), ddcci::checksum(&rev[..4]));
+fn test_negative_and_out_of_range_values_rejected() {
+    let _guard = mock_guard();
+    assert!(vcp::parse_value(0x10, &json!("-5")).is_err());
+    assert!(vcp::parse_value(0x10, &json!(-5)).is_err());
+    assert!(vcp::parse_value(0x10, &json!(150)).is_err());
+    assert!(vcp::parse_value(0x10, &json!("1_0")).is_err());
+    assert_eq!(vcp::parse_value(0x10, &json!("100")).unwrap(), 100);
+    assert_eq!(vcp::parse_value(0x60, &json!("0x1F")).unwrap(), 0x1F);
+    let mon = mon();
+    assert!(mon.set("brightness", &json!(-5)).is_err());
+    assert_eq!(mon.get_scaled("brightness").0, Some(45));
+}
+
+#[test]
+fn test_color_presets_follow_mccs() {
+    assert_eq!(vcp::parse_value(0x14, &json!("srgb")).unwrap(), 0x01);
+    assert_eq!(vcp::parse_value(0x14, &json!("native")).unwrap(), 0x02);
+    assert_eq!(vcp::parse_value(0x14, &json!("5000k")).unwrap(), 0x04);
+    assert_eq!(vcp::parse_value(0x14, &json!("6500k")).unwrap(), 0x05);
+    assert_eq!(vcp::parse_value(0x14, &json!("9300k")).unwrap(), 0x08);
+    let name = vcp::value_map(0x14)
+        .unwrap()
+        .iter()
+        .find(|(v, _)| *v == 0x05)
+        .unwrap()
+        .1;
+    assert_eq!(name, "6500k");
+}
+
+#[test]
+fn test_osd_and_power_values_follow_mccs() {
+    assert_eq!(vcp::parse_value(0xCA, &json!("lock")).unwrap(), 0x01);
+    assert_eq!(vcp::parse_value(0xCA, &json!("unlock")).unwrap(), 0x02);
+    assert_eq!(vcp::parse_value(0xD6, &json!("standby")).unwrap(), 0x02);
+    assert_eq!(vcp::parse_value(0xD6, &json!("off")).unwrap(), 0x04);
+    assert_eq!(vcp::parse_value(0xD6, &json!("hard-off")).unwrap(), 0x05);
+}
+
+#[test]
+fn test_checksum_known_vectors() {
+    // GET_VCP brightness request: 51 82 01 10 AC
+    assert_eq!(ddcci::checksum(&[0x51, 0x82, 0x01, 0x10]), 0xAC);
+    // SET_VCP brightness = 0x55: 51 84 03 10 00 55 FD
+    assert_eq!(ddcci::checksum(&[0x51, 0x84, 0x03, 0x10, 0x00, 0x55]), 0xFD);
 }
 
 #[test]
@@ -123,9 +161,11 @@ fn test_mock_monitor_power_and_preset_values() {
     let _guard = mock_guard();
     let mon = mon();
     mon.set("power", &json!("standby")).unwrap();
+    assert_eq!(mon.get("power-state").unwrap().value, Some(0x02));
+    mon.set("power", &json!("hard-off")).unwrap();
     assert_eq!(mon.get("power-state").unwrap().value, Some(0x05));
     mon.set("color-temp", &json!("6500k")).unwrap();
-    assert_eq!(mon.get("color-temp").unwrap().value, Some(0x02));
+    assert_eq!(mon.get("color-temp").unwrap().value, Some(0x05));
 }
 
 #[test]
@@ -139,7 +179,7 @@ fn test_monitor_set_unsupported_feature_raises() {
 fn test_presets_roundtrip() {
     let _guard = mock_guard();
     let path = tmpfile("presets");
-    let mut p = Presets::with_path(path.clone());
+    let mut p = Presets::with_path(path.clone()).unwrap();
     p.set(
         "work",
         spec_of(json!({"brightness": 70, "input": "dp1", "power": "on", "0x62": 33})),
@@ -151,7 +191,7 @@ fn test_presets_roundtrip() {
     assert_eq!(spec["input"], "dp1");
     assert_eq!(spec["power"], "on");
     assert_eq!(spec["0x62"], 33);
-    let mut p2 = Presets::with_path(path.clone());
+    let mut p2 = Presets::with_path(path.clone()).unwrap();
     assert_eq!(p2.get("work").unwrap(), &spec);
     let mon = mon();
     mon.set("brightness", &json!(70)).unwrap();
@@ -168,9 +208,28 @@ fn test_presets_roundtrip() {
 fn test_presets_invalid_feature_rejected() {
     let _guard = mock_guard();
     let path = tmpfile("p");
-    let mut p = Presets::with_path(path);
+    let mut p = Presets::with_path(path).unwrap();
     assert!(p.set("bad", spec_of(json!({"banana": 1}))).is_err());
     assert!(p.set("bad2", spec_of(json!({"input": "hdmi9"}))).is_err());
+    assert!(p.set("bad3", spec_of(json!({"brightness": 150}))).is_err());
+}
+
+#[test]
+fn test_corrupt_presets_file_is_an_error_and_is_kept() {
+    let path = tmpfile("corrupt");
+    let garbage = "{\"broken\": ";
+    std::fs::write(&path, garbage).unwrap();
+    assert!(Presets::with_path(path.clone()).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_missing_presets_file_is_empty() {
+    let path = tmpfile("missing");
+    let _ = std::fs::remove_file(&path);
+    let p = Presets::with_path(path).unwrap();
+    assert!(p.names().is_empty());
 }
 
 #[test]
@@ -182,7 +241,7 @@ fn test_presets_snapshot_matches_mock_state() {
     assert_eq!(spec["brightness"], 22);
     assert_eq!(spec["input-source"], "dp1");
     let path = tmpfile("p");
-    let mut p = Presets::with_path(path);
+    let mut p = Presets::with_path(path).unwrap();
     p.set("snap", spec.clone()).unwrap();
     mon.set("brightness", &json!(88)).unwrap();
     for (f, v) in &spec {
@@ -217,17 +276,30 @@ fn test_frame_builder_validator() {
 }
 
 #[test]
-fn test_based_on_config_mock() {
-    let b = based_on_config("mock").unwrap();
-    assert_eq!(b.name(), "mock");
+fn test_caps_string_ignores_value_lists() {
+    let caps = "(prot(monitor)type(lcd)model(U3011)cmds(01 02 03 07 0C E3 F3)vcp(02 04 05 06 08 10 12 14(01 05 08 0B 0C) 16 18 1A 52 60(01 03 04 0C 0F 11 12) AC AE B2 B6 C6 C8 C9 D6(01 04 05) DC(00 02 03 04 05) DF FD)mccs_ver(2.1)mswhql(1))";
+    assert_eq!(
+        ddcci::parse_caps_string(caps),
+        vec![
+            0x02, 0x04, 0x05, 0x06, 0x08, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1A, 0x52, 0x60, 0xAC,
+            0xAE, 0xB2, 0xB6, 0xC6, 0xC8, 0xC9, 0xD6, 0xDC, 0xDF, 0xFD
+        ]
+    );
 }
 
 #[test]
-fn test_getvcp_probe_bytes_xor() {
-    let probe = [0x51u8, 0x02 | 0x80, OP_GET_VCP, 0x10];
-    // Python asserted the checksum is an int; assert the concrete value.
-    let ck = ddcci::checksum(&[&[0x6Eu8], &probe[..]].concat());
-    assert_eq!(ck, ddcci::xor(&[0x6Eu8, 0x6E, 0x51, 0x82, 0x01, 0x10]));
+fn test_feature_lines_from_ddcutil_report() {
+    let report = "VCP Features:\n   Feature: 02 (New control value)\n   Feature: 10 (Brightness)\n   Feature: 14 (Select color preset)\n      Values:\n         05: 6500 K\n   Feature: 60 (Input Source)\n   Feature: D6 (Power mode)\n";
+    assert_eq!(
+        ddcci::parse_feature_lines(report),
+        vec![0x02, 0x10, 0x14, 0x60, 0xD6]
+    );
+}
+
+#[test]
+fn test_based_on_config_mock() {
+    let b = based_on_config("mock").unwrap();
+    assert_eq!(b.name(), "mock");
 }
 
 #[test]

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -206,32 +207,57 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// Run a helper command with a timeout and return its stdout. A non-zero exit
+/// becomes an error that quotes stderr (or stdout, when stderr is empty), so a
+/// failed command is never mistaken for a successful one.
 fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
+    use std::io::Read;
+
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to spawn {:?}", cmd))?;
-    match child.wait_timeout(timeout)? {
-        Some(_status) => {
-            let mut out = String::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                use std::io::Read;
-                let _ = pipe.read_to_string(&mut out);
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                use std::io::Read;
-                let mut err = String::new();
-                let _ = pipe.read_to_string(&mut err);
-            }
-            Ok(out)
-        }
+        .with_context(|| format!("failed to start {:?}", cmd))?;
+    // Drain both pipes on their own threads, so a child that writes a lot
+    // cannot block on a full pipe while we wait for it to exit.
+    let mut stdout = child.stdout.take().context("stdout pipe missing")?;
+    let mut stderr = child.stderr.take().context("stderr pipe missing")?;
+    let out_reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let err_reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
         None => {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = out_reader.join();
+            let _ = err_reader.join();
             bail!("command timed out after {}s: {:?}", timeout.as_secs(), cmd);
         }
+    };
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    if !status.success() {
+        let detail = if err.trim().is_empty() {
+            out.trim()
+        } else {
+            err.trim()
+        };
+        bail!(
+            "{} exited with {}: {}",
+            cmd.get_program().to_string_lossy(),
+            status,
+            detail
+        );
     }
+    Ok(out)
 }
 
 fn busno(display: &DisplayInfo) -> Option<u64> {
@@ -331,7 +357,11 @@ impl Backend for DdcutilBackend {
             Duration::from_secs(15),
         )
         .ok()?;
-        let caps = ddcci::parse_caps_string(&out);
+        let caps = if out.contains("vcp(") {
+            ddcci::parse_caps_string(&out)
+        } else {
+            ddcci::parse_feature_lines(&out)
+        };
         if caps.is_empty() {
             None
         } else {
@@ -353,14 +383,17 @@ impl Backend for DdcutilBackend {
         let max_re = regex::Regex::new(r"(?i)max(?:\s+value)?\s*=\s*0*(\d+)").unwrap();
         let m = cur_re.captures(&out);
         let mx = max_re.captures(&out);
+        let Some(value) = m.and_then(|c| c[1].parse::<u16>().ok()) else {
+            bail!(
+                "could not parse ddcutil output for 0x{:02X}: {}",
+                code,
+                out.trim()
+            );
+        };
         Ok(VcpFrame {
-            result: if m.is_some() {
-                ddcci::RESULT_OK
-            } else {
-                ddcci::RESULT_BROKEN
-            },
+            result: ddcci::RESULT_OK,
             code,
-            value: m.and_then(|c| c[1].parse::<u16>().ok()),
+            value: Some(value),
             max: mx.and_then(|c| c[1].parse::<u16>().ok()),
         })
     }
@@ -516,4 +549,35 @@ pub fn monitors(selector: &str) -> Result<(Arc<dyn Backend>, Vec<Monitor>)> {
         .map(|info| Monitor::new(backend.clone(), info))
         .collect();
     Ok((backend, mons))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_returns_stdout_on_success() {
+        let out = run(
+            Command::new("sh").arg("-c").arg("echo hi"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn run_turns_failure_into_error_with_stderr() {
+        let err = run(
+            Command::new("sh").arg("-c").arg("echo boom >&2; exit 3"),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn run_enforces_timeout() {
+        let err = run(Command::new("sleep").arg("5"), Duration::from_millis(200)).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
 }
