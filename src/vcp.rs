@@ -68,7 +68,7 @@ pub const INPUT_VALUES: &[(u16, &str)] = &[
     (0x12, "hdmi2"),
     (0x17, "mdp1"),
     (0x18, "dp3"),
-    (0x19, "usbc"),
+    (0x1B, "usbc"),
 ];
 
 pub const MUTE_VALUES: &[(u16, &str)] = &[(0x01, "unmute"), (0x02, "mute")];

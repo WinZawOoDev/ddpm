@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 
 use crate::driver::{bus_lock, Backend, DisplayInfo, VcpFrame};
+use crate::vcp;
 
 const I2C_SLAVE: libc::c_ulong = 0x0703;
 pub const DDC_ADDR: u16 = 0x37;
@@ -371,6 +372,17 @@ impl DDCCIDriver {
     }
 }
 
+/// Value of a reply as the feature defines it. Non-continuous features with a
+/// value table keep their value in the low byte only. Some displays also fill
+/// the high byte: the Dell S2722QC reports input source 0x1B as 0x1B1B.
+pub fn value_from_reply(code: u8, raw: u16) -> u16 {
+    if vcp::value_map(code).is_some() {
+        raw & 0xFF
+    } else {
+        raw
+    }
+}
+
 fn bus_path(display: &DisplayInfo) -> Result<&str> {
     display
         .bus
@@ -416,7 +428,7 @@ impl Backend for DDCCIDriver {
                         result: frame.result,
                         code: frame.code,
                         max: Some(frame.max),
-                        value: Some(frame.value),
+                        value: Some(value_from_reply(code, frame.value)),
                     });
                 }
                 // The display answered "unsupported": retrying cannot help.

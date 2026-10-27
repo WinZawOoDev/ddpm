@@ -354,3 +354,79 @@ fn test_collect_fragments_is_bounded() {
     let err = ddcci::collect_fragments(|_| Ok(vec![b'x'; 100])).unwrap_err();
     assert!(err.to_string().contains("longer than"), "{err}");
 }
+
+/// Output of `ddcutil detect --terse` captured on the development machine: a
+/// laptop panel reported as "Invalid display", and a Dell S2722QC.
+const DETECT_TERSE: &str = "Invalid display
+   I2C bus:          /dev/i2c-11
+   DRM connector:    card1-eDP-1
+   drm_connector_id: 507
+   Monitor:          AUO::
+
+Display 1
+   I2C bus:          /dev/i2c-14
+   DRM connector:    card1-DP-3
+   drm_connector_id: 544
+   Monitor:          DEL:DELL S2722QC:4WTGMD3
+";
+
+#[test]
+fn test_detect_terse_skips_invalid_displays() {
+    let displays = ddpm::driver::parse_detect_terse(DETECT_TERSE);
+    assert_eq!(displays.len(), 1);
+    let d = &displays[0];
+    assert_eq!(d.bus.as_deref(), Some("/dev/i2c-14"));
+    assert_eq!(d.name, "DELL S2722QC");
+    assert_eq!(d.mfr.as_deref(), Some("DEL"));
+    assert_eq!(d.serial.as_deref(), Some("4WTGMD3"));
+}
+
+#[test]
+fn test_getvcp_terse_formats() {
+    // Continuous feature: value and maximum.
+    assert_eq!(
+        ddpm::driver::parse_getvcp_terse("VCP 10 C 70 100\n", 0x10),
+        Some((70, Some(100)))
+    );
+    // Simple non-continuous feature: hex value, no maximum.
+    assert_eq!(
+        ddpm::driver::parse_getvcp_terse("VCP 14 SNC x05\n", 0x14),
+        Some((5, None))
+    );
+    assert_eq!(
+        ddpm::driver::parse_getvcp_terse("VCP 60 SNC x1b\n", 0x60),
+        Some((0x1B, None))
+    );
+    // Unsupported code: the display answers with a CNC line, which is not a value.
+    assert_eq!(
+        ddpm::driver::parse_getvcp_terse("VCP 77 CNC xff xff x00 x00\n", 0x77),
+        None
+    );
+    // An error line, and a reply for a different code.
+    assert_eq!(ddpm::driver::parse_getvcp_terse("VCP 10 ERR\n", 0x10), None);
+    assert_eq!(
+        ddpm::driver::parse_getvcp_terse("VCP 14 SNC x05\n", 0x10),
+        None
+    );
+}
+
+#[test]
+fn test_nc_features_use_low_byte() {
+    // Dell S2722QC: input source 0x1B arrives as 0x1B1B.
+    assert_eq!(ddcci::value_from_reply(0x60, 0x1B1B), 0x1B);
+    assert_eq!(ddcci::value_from_reply(0x14, 0x0005), 0x05);
+    // Continuous features keep the full 16-bit value.
+    assert_eq!(ddcci::value_from_reply(0x10, 0x0064), 0x64);
+}
+
+#[test]
+fn test_usbc_input_is_0x1b() {
+    assert_eq!(vcp::parse_value(0x60, &json!("usbc")).unwrap(), 0x1B);
+    assert_eq!(
+        vcp::value_map(0x60)
+            .unwrap()
+            .iter()
+            .find(|(v, _)| *v == 0x19),
+        None
+    );
+}

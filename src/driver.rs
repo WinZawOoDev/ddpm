@@ -305,6 +305,86 @@ fn busno(display: &DisplayInfo) -> Option<u64> {
     bus.rsplit('-').next().and_then(|s| s.parse::<u64>().ok())
 }
 
+/// Parse `ddcutil detect --terse` into displays. A section that starts with
+/// "Invalid display" is not a DDC/CI display (a laptop panel, for example), so
+/// it is dropped together with its lines.
+pub fn parse_detect_terse(out: &str) -> Vec<DisplayInfo> {
+    let mut displays: Vec<DisplayInfo> = Vec::new();
+    let mut cur: Option<DisplayInfo> = None;
+    for ln in out.lines() {
+        let trimmed = ln.trim();
+        if trimmed.starts_with("Invalid display") {
+            if let Some(prev) = cur.take() {
+                displays.push(prev);
+            }
+            continue;
+        }
+        // Section headers: "Display:" or "Display 1".
+        if trimmed.starts_with("Display:") || trimmed.starts_with("Display ") {
+            if let Some(prev) = cur.take() {
+                displays.push(prev);
+            }
+            cur = Some(DisplayInfo {
+                name: "Display".to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(info) = cur.as_mut() else { continue };
+        if let Some(val) = trimmed.strip_prefix("I2C bus:") {
+            info.bus = Some(val.trim().to_string());
+        } else if let Some(val) = trimmed.strip_prefix("Monitor:") {
+            // "Monitor: MFR:MODEL:SERIAL" (ddcutil >= 2.0 --terse)
+            let parts: Vec<&str> = val.trim().split(':').collect();
+            if parts.len() == 3 {
+                if info.mfr.is_none() && !parts[0].is_empty() {
+                    info.mfr = Some(parts[0].to_string());
+                }
+                if !parts[1].is_empty() && info.name == "Display" {
+                    info.name = parts[1].to_string();
+                }
+                if info.serial.is_none() && !parts[2].is_empty() {
+                    info.serial = Some(parts[2].to_string());
+                }
+            }
+        } else if let Some(val) = trimmed.strip_prefix("Model:") {
+            info.name = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("Serial number:") {
+            info.serial = Some(val.trim().to_string());
+        } else if let Some(val) = trimmed.strip_prefix("Manufacturer:") {
+            info.mfr = Some(val.trim().to_string());
+        }
+    }
+    if let Some(prev) = cur {
+        displays.push(prev);
+    }
+    displays.into_iter().filter(|d| d.bus.is_some()).collect()
+}
+
+/// Parse the value line of `ddcutil --terse getvcp`. A continuous feature
+/// reads `VCP 10 C 70 100` (value and maximum). A simple non-continuous feature
+/// reads `VCP 14 SNC x05` (hex value). Anything else, such as `VCP 10 ERR` or
+/// the `CNC` line for an unsupported code, gives None.
+pub fn parse_getvcp_terse(out: &str, code: u8) -> Option<(u16, Option<u16>)> {
+    let line = out.lines().find(|l| l.trim_start().starts_with("VCP "))?;
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.len() < 4 || u8::from_str_radix(tokens[1], 16).ok()? != code {
+        return None;
+    }
+    match tokens[2] {
+        "C" => {
+            let value = tokens[3].parse::<u16>().ok()?;
+            let max = tokens.get(4).and_then(|m| m.parse::<u16>().ok());
+            Some((value, max))
+        }
+        "SNC" => {
+            let value = u16::from_str_radix(tokens[3].strip_prefix('x')?, 16).ok()?;
+            Some((value, None))
+        }
+        _ => None,
+    }
+}
+
 pub struct DdcutilBackend {
     bin: PathBuf,
 }
@@ -338,53 +418,7 @@ impl Backend for DdcutilBackend {
             Command::new(&self.bin).arg("detect").arg("--terse"),
             Duration::from_secs(15),
         )?;
-        let mut displays: Vec<DisplayInfo> = Vec::new();
-        let mut cur: Option<DisplayInfo> = None;
-        for ln in out.lines() {
-            let trimmed = ln.trim();
-            // Section headers: "Display:", "Display 1", "Invalid display".
-            if trimmed.starts_with("Display:")
-                || trimmed.starts_with("Display ")
-                || trimmed.starts_with("Invalid display")
-            {
-                if let Some(prev) = cur.take() {
-                    displays.push(prev);
-                }
-                cur = Some(DisplayInfo {
-                    name: "Display".to_string(),
-                    ..Default::default()
-                });
-                continue;
-            }
-            let Some(info) = cur.as_mut() else { continue };
-            if let Some(val) = trimmed.strip_prefix("I2C bus:") {
-                info.bus = Some(val.trim().to_string());
-            } else if let Some(val) = trimmed.strip_prefix("Monitor:") {
-                // "Monitor: MFR:MODEL:SERIAL" (ddcutil >= 2.0 --terse)
-                let parts: Vec<&str> = val.trim().split(':').collect();
-                if parts.len() == 3 {
-                    if info.mfr.is_none() && !parts[0].is_empty() {
-                        info.mfr = Some(parts[0].to_string());
-                    }
-                    if !parts[1].is_empty() && info.name == "Display" {
-                        info.name = parts[1].to_string();
-                    }
-                    if info.serial.is_none() && !parts[2].is_empty() {
-                        info.serial = Some(parts[2].to_string());
-                    }
-                }
-            } else if let Some(val) = trimmed.strip_prefix("Model:") {
-                info.name = val.trim().to_string();
-            } else if let Some(val) = trimmed.strip_prefix("Serial number:") {
-                info.serial = Some(val.trim().to_string());
-            } else if let Some(val) = trimmed.strip_prefix("Manufacturer:") {
-                info.mfr = Some(val.trim().to_string());
-            }
-        }
-        if let Some(prev) = cur {
-            displays.push(prev);
-        }
-        Ok(displays.into_iter().filter(|d| d.bus.is_some()).collect())
+        Ok(parse_detect_terse(&out))
     }
 
     fn capabilities(&self, display: &DisplayInfo) -> Option<Vec<u8>> {
@@ -415,15 +449,12 @@ impl Backend for DdcutilBackend {
             Command::new(&self.bin)
                 .arg("--bus")
                 .arg(busno(display).map(|b| b.to_string()).unwrap_or_default())
+                .arg("--terse")
                 .arg("getvcp")
                 .arg(format!("0x{:02x}", code)),
             Duration::from_secs(15),
         )?;
-        let cur_re = regex::Regex::new(r"(?i)current(?:\s+value)?\s*=\s*0*(\d+)").unwrap();
-        let max_re = regex::Regex::new(r"(?i)max(?:\s+value)?\s*=\s*0*(\d+)").unwrap();
-        let m = cur_re.captures(&out);
-        let mx = max_re.captures(&out);
-        let Some(value) = m.and_then(|c| c[1].parse::<u16>().ok()) else {
+        let Some((value, max)) = parse_getvcp_terse(&out, code) else {
             bail!(
                 "could not parse ddcutil output for 0x{:02X}: {}",
                 code,
@@ -434,7 +465,7 @@ impl Backend for DdcutilBackend {
             result: ddcci::RESULT_OK,
             code,
             value: Some(value),
-            max: mx.and_then(|c| c[1].parse::<u16>().ok()),
+            max,
         })
     }
 

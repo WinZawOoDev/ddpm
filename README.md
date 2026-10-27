@@ -57,7 +57,7 @@ ddpm list -v                          # enumerate displays + supported features
 ddpm detect                           # raw i2c bus scan (ddcci backend)
 ddpm get 1 brightness contrast input-source power-state
 ddpm set 1 brightness=75              # 0-100
-ddpm set 1 input-source=hdmi1         # also: dp1, dp3 (USB-C), dvi1, vga1...
+ddpm set 1 input-source=hdmi1         # also: dp1, dp3, usbc, dvi1, vga1...
 ddpm set 1 power=on osd=lock volume=40
 ddpm set 1 0x62=30                    # raw VCP feature codes too
 ddpm preset save work                 # snapshot current settings of display 1
