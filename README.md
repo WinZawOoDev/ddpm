@@ -6,6 +6,10 @@ Manager (DDPM/DDM)** on Linux. It talks to monitors directly over
 is installed. Dell's DDPM itself is Windows/macOS-only; this project is an
 independent implementation of its most-used feature set.
 
+This is the **Rust** implementation (originally Python; the legacy sources
+are kept in `ddpm/` for reference). Two binaries are built: `ddpm` (CLI) and
+`ddpm-gui` (eframe/egui window).
+
 ## Features
 
 | Feature | CLI | GUI |
@@ -21,23 +25,30 @@ independent implementation of its most-used feature set.
 
 ## Install
 
+Build with cargo (Rust 1.80+; install the toolchain with
+[rustup](https://rustup.rs) if needed):
+
 ```bash
-cd ddpm-project            # this directory
-sudo ./install.sh          # installs ddcutil + i2c-dev rules, pip installs ./
+cargo install --path .       # installs ddpm and ddpm-gui to ~/.cargo/bin
 ```
 
-or manually:
+System setup (same as before; needed for the direct-i2c driver and
+recommended for ddcutil):
 
 ```bash
-sudo apt install ddcutil python3-pip i2c-tools
+sudo apt install ddcutil i2c-tools
 sudo modprobe i2c-dev
 sudo groupadd -f i2c && sudo usermod -aG i2c $USER    # relogin after
-pip3 install .
 ```
 
-Without `ddcutil` installed the built-in pure-Python DDC/CI driver is used
-instead — it needs read/write access to `/dev/i2c-N` (the `i2c` group or the
-udev rule above provides that).
+Without `ddcutil` installed the built-in Rust DDC/CI driver is used
+instead — it needs read/write access to `/dev/i2c-N` (the `i2c` group or a
+udev rule provides that):
+
+```
+# /etc/udev/rules.d/45-i2c.rules
+KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"
+```
 
 ## CLI usage
 
@@ -65,9 +76,10 @@ serial, or a short-name mapped with `ddpm set` in config.
 ddpm-gui
 ```
 
-A tabbed window: one tab per display, sliders for brightness/contrast/volume,
-dropdowns for input/color temp/power/OSD/mute, plus a preset bar (apply/save).
-Slow DDC/CI traffic happens on background threads so the UI stays responsive.
+A tabbed window (eframe/egui): one tab per display, sliders for
+brightness/contrast/volume, dropdowns for input/color temp/power/OSD/mute,
+plus a preset bar (apply/save). Slow DDC/CI traffic happens on background
+threads so the UI stays responsive.
 
 ## Presets & config
 
@@ -76,29 +88,32 @@ Slow DDC/CI traffic happens on background threads so the UI stays responsive.
   or raw codes (`"0x62": 30`).
 - `~/.config/ddpm/config.json` — `driver` (auto|ddcutil|ddcci), monitor
   nicknames, etc.
+- Override the config directory with `DDPM_CONFIG_DIR`.
 
 ## Architecture
 
 ```
-ddpm/
-  ddcci.py     pure-Python DDC/CI frames over /dev/i2c-N (probe, get, set)
-  driver.py    backend selection + Monitor abstraction (+ ddcutil, mock)
-  vcp.py       VCP feature tables and token parsing
-  presets.py   named preset store (JSON)
-  config.py    user config (JSON)
-  cli.py       argparse CLI
-  gui.py       tkinter app
-tests/         pytest suite (no hardware required)
+src/
+  vcp.rs       VCP feature tables and token parsing
+  ddcci.rs     pure-Rust DDC/CI frames over /dev/i2c-N (probe, get, set)
+  driver.rs    backend selection + Monitor abstraction (+ ddcutil, mock)
+  presets.rs   named preset store (JSON)
+  config.rs    user config (JSON)
+  cli.rs       clap CLI (bin: ddpm)
+  bin/gui.rs   eframe/egui app (bin: ddpm-gui)
+tests/
+  core.rs      integration tests (no hardware required)
 ```
 
-Both backends speak the same `Monitor` API, so the CLI and GUI are backend
-agnostic. `ddcutil` is preferred when present (it handles multi-transport
-quirks); the `ddcci` driver needs no external tools at all.
+All backends speak the same `Monitor` API (the `Backend` trait), so the CLI
+and GUI are backend agnostic. `ddcutil` is preferred when present (it
+handles multi-transport quirks); the `ddcci` driver needs no external tools
+at all.
 
 ## Verify without a monitor
 
 ```bash
-python3 -m pytest tests -q
+cargo test
 ddpm --backend mock list
 ```
 
@@ -106,6 +121,8 @@ ddpm --backend mock list
 
 - Monitors must expose DDC/CI (Dell displays: enable in the OSD if needed).
 - `ddcutil` caps/quirks can be slow; the GUI runs ops in the background.
+- The `ddcutil` backend parses both classic and modern (>= 2.0) `--terse`
+  `detect` output.
 - USB-KVM matrix switching (per-input USB routing) is vendor firmware
   (Dell uses nonstandard VCP/hub codes) and is not implemented here —
   input switching still works as DDPM does on the video side.
