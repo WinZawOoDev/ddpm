@@ -80,7 +80,6 @@ fn name_from_value(code: u8, value: u16) -> Option<String> {
 }
 
 struct App {
-    backend_label: String,
     /// Backend selector used for every reload (from --backend or the config).
     backend_sel: String,
     tx: Sender<GuiMsg>,
@@ -100,7 +99,6 @@ impl App {
             Err(e) => ("auto".to_string(), Some(e.to_string())),
         };
         let mut app = App {
-            backend_label: backend_sel.clone(),
             backend_sel,
             tx,
             rx,
@@ -255,6 +253,7 @@ fn draw_display_preview(
     ui: &mut egui::Ui,
     width: f32,
     brightness: Option<u16>,
+    model_name: &str,
     input: &str,
     color_temp: &str,
 ) {
@@ -374,7 +373,7 @@ fn draw_display_preview(
     painter.text(
         egui::pos2(bounds.left() + 16.0, bounds.bottom() - 15.0),
         egui::Align2::LEFT_CENTER,
-        format!("{}% brightness   ·   {}", percent, input_label),
+        format!("{}   ·   Input source: {}", model_name, input_label),
         egui::FontId::proportional(12.0),
         egui::Color32::from_rgb(183, 199, 216),
     );
@@ -386,51 +385,6 @@ impl eframe::App for App {
             self.handle(msg);
         }
 
-        egui::TopBottomPanel::top("ddpm_header")
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(13, 19, 29)))
-            .show(ctx, |ui| {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("DDPM")
-                                .size(23.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(235, 243, 252)),
-                        );
-                        ui.label(
-                            egui::RichText::new("DISPLAY CONTROL CENTER")
-                                .size(10.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(112, 145, 180)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let refresh_label = if self.loading {
-                            "Scanning…"
-                        } else {
-                            "↻  Refresh"
-                        };
-                        if ui
-                            .add_enabled(!self.loading, egui::Button::new(refresh_label))
-                            .clicked()
-                        {
-                            self.reload();
-                        }
-                        egui::Frame::group(ui.style())
-                            .fill(egui::Color32::from_rgb(23, 34, 48))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{} backend", self.backend_label))
-                                        .size(12.0)
-                                        .color(egui::Color32::from_rgb(174, 196, 218)),
-                                );
-                            });
-                    });
-                });
-                ui.add_space(10.0);
-            });
-
         let mut pending_slider: Option<usize> = None;
         let mut pending_menu: Option<usize> = None;
 
@@ -438,15 +392,6 @@ impl eframe::App for App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.heading("Your displays");
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!("{} detected", self.mons.len()))
-                                .color(egui::Color32::from_rgb(133, 156, 181)),
-                        );
-                    });
                     ui.add_space(8.0);
 
                     if self.mons.is_empty() {
@@ -489,7 +434,7 @@ impl eframe::App for App {
                                 )
                             })
                             .collect();
-                        ui.horizontal_wrapped(|ui| {
+                        ui.horizontal(|ui| {
                             for (i, (name, bus)) in cards.iter().enumerate() {
                                 egui::Frame::group(ui.style())
                                     .fill(if self.tab == i {
@@ -501,9 +446,13 @@ impl eframe::App for App {
                                         ui.set_min_width(190.0);
                                         let response = ui.selectable_label(
                                             self.tab == i,
-                                            egui::RichText::new(name)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(225, 237, 249)),
+                                            egui::RichText::new(format!(
+                                                "Display {} · {}",
+                                                i + 1,
+                                                name
+                                            ))
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(225, 237, 249)),
                                         );
                                         if response.clicked() {
                                             self.tab = i;
@@ -515,43 +464,30 @@ impl eframe::App for App {
                                         );
                                     });
                             }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let refresh_label = if self.loading {
+                                        "Scanning…"
+                                    } else {
+                                        "↻  Refresh"
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            !self.loading,
+                                            egui::Button::new(refresh_label),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.reload();
+                                    }
+                                },
+                            );
                         });
 
                         let tab = self.tab.min(self.mons.len() - 1);
                         self.tab = tab;
                         let mon = self.mons[tab].clone();
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.heading(display_name(&mon, tab));
-                                let mut details = Vec::new();
-                                if let Some(serial) = mon.serial() {
-                                    details.push(format!("S/N {serial}"));
-                                }
-                                if let Some(bus) = mon.bus() {
-                                    details.push(bus.to_string());
-                                }
-                                ui.label(
-                                    egui::RichText::new(if details.is_empty() {
-                                        "Connected over DDC/CI".to_string()
-                                    } else {
-                                        details.join("   ·   ")
-                                    })
-                                    .color(egui::Color32::from_rgb(137, 159, 183)),
-                                );
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new("CONNECTED")
-                                            .size(10.0)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(112, 220, 168)),
-                                    );
-                                },
-                            );
-                        });
                         ui.add_space(10.0);
 
                         if let Some(panel) = self.panels.get_mut(tab) {
@@ -584,6 +520,7 @@ impl eframe::App for App {
                                             ui,
                                             ui.available_width(),
                                             brightness,
+                                            &display_name(&mon, tab),
                                             &input,
                                             &color_temp,
                                         );
