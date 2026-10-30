@@ -16,7 +16,7 @@ This is the **Rust** implementation. Two binaries are built: `ddpm` (CLI) and
 | Enumerate displays (model, serial, bus, features) | `list`, `detect` | yes |
 | Brightness / contrast / volume (0-100) | `get`, `set` | sliders |
 | Input source (vga, dvi, dp, hdmi, usb-c...) | `get`, `set` | dropdown |
-| Power state (on / standby / suspend / off / hard-off), OSD lock/unlock, mute | `get`, `set` | dropdown |
+| Power state (on / standby / suspend / off / hard-off), mute; OSD lock/unlock (CLI) | `get`, `set` | power/mute dropdowns |
 | Color temperature presets | `get`, `set` | dropdown |
 | Raw VCP codes | `get`/`set 0x62` | - |
 | Named presets (save snapshot, apply later) | `preset` | buttons |
@@ -77,7 +77,7 @@ ddpm-gui                          # or: ddpm-gui --backend mock
 ```
 
 A tabbed window (eframe/egui): one tab per display, sliders for
-brightness/contrast/volume, dropdowns for input/color temp/power/OSD/mute,
+brightness/contrast/volume, dropdowns for input/color temp/power/mute,
 plus a preset bar (apply/save). Slow DDC/CI traffic happens on background
 threads so the UI stays responsive.
 
