@@ -388,7 +388,17 @@ impl eframe::App for App {
         let mut pending_slider: Option<usize> = None;
         let mut pending_menu: Option<usize> = None;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .inner_margin(egui::Margin {
+                        left: 16.0,
+                        right: 16.0,
+                        top: 16.0,
+                        bottom: 0.0,
+                    }),
+            )
+            .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -638,9 +648,8 @@ impl eframe::App for App {
                         }
 
                     }
-                    ui.add_space(18.0);
                 });
-        });
+            });
 
         if let Some(i) = pending_slider {
             self.apply_slider(i);
@@ -674,12 +683,12 @@ fn main() -> eframe::Result<()> {
     let args = GuiArgs::parse();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 850.0])
-            .with_min_inner_size([800.0, 620.0]),
+            .with_inner_size([1100.0, 560.0])
+            .with_min_inner_size([820.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "DDPM - Dell Display and Peripheral Manager (clone)",
+        "DDPM",
         options,
         Box::new(move |cc| {
             let mut visuals = egui::Visuals::dark();
