@@ -2,10 +2,8 @@
 //!
 //! Port of the tkinter GUI: one tab per display, sliders for
 //! brightness/contrast/volume, dropdowns for input/color temp/power/mute,
-//! plus a preset bar (apply/save). Slow DDC/CI traffic happens on background
-//! threads so the UI stays responsive.
+//! with slow DDC/CI traffic on background threads so the UI stays responsive.
 
-use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -14,7 +12,6 @@ use serde_json::Value;
 
 use clap::Parser;
 use ddpm::driver::{monitors, resolve_backend, BackendSel, Monitor};
-use ddpm::presets::Presets;
 use ddpm::vcp;
 
 const FEATURE_LABELS: [(&str, &str); 3] = [
@@ -39,7 +36,6 @@ struct GuiArgs {
     backend: Option<BackendSel>,
 }
 
-type Spec = BTreeMap<String, Value>;
 type ValueTable = &'static [(u16, &'static str)];
 
 enum GuiMsg {
@@ -49,10 +45,6 @@ enum GuiMsg {
     Panel(String, PanelData),
     /// a plain set finished: error -> popup
     SetDone(Result<(), String>),
-    /// a preset apply finished: ok -> reload, error -> popup
-    Applied(Result<(), String>),
-    /// snapshot finished for a "Save as..." with the chosen name
-    Snapshot(String, Result<Spec, String>),
 }
 
 struct PanelData {
@@ -96,14 +88,8 @@ struct App {
     mons: Vec<Monitor>,
     panels: Vec<PanelUi>,
     tab: usize,
-    presets: Result<Presets, String>,
-    preset_names: Vec<String>,
-    preset_sel: String,
-    save_open: bool,
-    save_name: String,
     loading: bool,
     error: Option<String>,
-    info: Option<String>,
 }
 
 impl App {
@@ -121,19 +107,9 @@ impl App {
             mons: Vec::new(),
             panels: Vec::new(),
             tab: 0,
-            presets: Presets::new().map_err(|e| e.to_string()),
-            preset_names: Vec::new(),
-            preset_sel: String::new(),
-            save_open: false,
-            save_name: String::new(),
             loading: false,
             error: backend_error,
-            info: None,
         };
-        app.refresh_presets();
-        if app.error.is_none() {
-            app.error = app.presets.as_ref().err().cloned();
-        }
         app.reload();
         app
     }
@@ -150,8 +126,6 @@ impl App {
     }
 
     fn reload(&mut self) {
-        // Re-read presets too, so changes made by the CLI show up on Refresh.
-        self.presets = Presets::new().map_err(|e| e.to_string());
         self.loading = true;
         let sel = self.backend_sel.clone();
         let tx = self.tx.clone();
@@ -190,13 +164,6 @@ impl App {
         );
     }
 
-    fn refresh_presets(&mut self) {
-        self.preset_names = self.presets.as_ref().map(|p| p.names()).unwrap_or_default();
-        if !self.preset_names.is_empty() && self.preset_sel.is_empty() {
-            self.preset_sel = self.preset_names[0].clone();
-        }
-    }
-
     fn current_mon(&self) -> Option<&Monitor> {
         self.mons.get(self.tab)
     }
@@ -212,7 +179,6 @@ impl App {
                     self.panels.push(PanelUi::new(m.uuid()));
                     self.refresh_panel(m);
                 }
-                self.refresh_presets();
             }
             GuiMsg::Reload(Err(e)) => {
                 self.loading = false;
@@ -239,22 +205,6 @@ impl App {
             }
             GuiMsg::SetDone(Err(e)) => self.error = Some(e),
             GuiMsg::SetDone(Ok(())) => {}
-            GuiMsg::Applied(Ok(())) => self.reload(),
-            GuiMsg::Applied(Err(e)) => self.error = Some(e),
-            GuiMsg::Snapshot(name, res) => match res {
-                Ok(spec) => {
-                    match self.presets.as_mut() {
-                        Ok(store) => {
-                            if let Err(e) = store.set(&name, spec) {
-                                self.error = Some(e.to_string());
-                            }
-                        }
-                        Err(e) => self.error = Some(e.clone()),
-                    }
-                    self.refresh_presets();
-                }
-                Err(e) => self.error = Some(e),
-            },
         }
     }
 
@@ -290,66 +240,6 @@ impl App {
             },
             |res| GuiMsg::SetDone(res.map(|_| ())),
         );
-    }
-
-    fn start_save_preset(&mut self, name: String) {
-        let Some(mon) = self.current_mon().cloned() else {
-            return;
-        };
-        self.submit(
-            move || {
-                let spec = ddpm::cli::snapshot(&mon);
-                Ok((name, spec))
-            },
-            |res| match res {
-                Ok((name, spec)) => GuiMsg::Snapshot(name, Ok(spec)),
-                Err(e) => GuiMsg::Snapshot(String::new(), Err(e)),
-            },
-        );
-    }
-
-    fn apply_preset(&mut self) {
-        let name = self.preset_sel.clone();
-        if name.is_empty() {
-            return;
-        }
-        let Some(mon) = self.current_mon().cloned() else {
-            return;
-        };
-        let Some(spec) = self
-            .presets
-            .as_ref()
-            .ok()
-            .and_then(|p| p.get(&name))
-            .cloned()
-        else {
-            return;
-        };
-        self.submit(
-            move || {
-                for (f, val) in &spec {
-                    mon.set(f, val).map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            },
-            GuiMsg::Applied,
-        );
-    }
-
-    fn delete_preset(&mut self) {
-        let name = self.preset_sel.clone();
-        if name.is_empty() {
-            return;
-        }
-        match self.presets.as_mut() {
-            Ok(store) => {
-                if let Err(e) = store.delete(&name) {
-                    self.error = Some(e.to_string());
-                }
-            }
-            Err(e) => self.error = Some(e.clone()),
-        }
-        self.refresh_presets();
     }
 }
 
@@ -810,61 +700,6 @@ impl eframe::App for App {
                                 });
                         }
 
-                        ui.add_space(12.0);
-                        egui::Frame::group(ui.style())
-                            .fill(egui::Color32::from_rgb(20, 29, 41))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(egui::RichText::new("Saved looks").strong());
-                                        ui.label(
-                                            egui::RichText::new("Save and restore display settings")
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(127, 151, 177)),
-                                        );
-                                    });
-                                    ui.add_space(10.0);
-                                    let names = self.preset_names.clone();
-                                    egui::ComboBox::from_id_salt("preset_sel")
-                                        .width(190.0)
-                                        .selected_text(if self.preset_sel.is_empty() {
-                                            "Choose a saved look…"
-                                        } else {
-                                            &self.preset_sel
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            for name in names {
-                                                ui.selectable_value(
-                                                    &mut self.preset_sel,
-                                                    name.clone(),
-                                                    &name,
-                                                );
-                                            }
-                                        });
-                                    if ui
-                                        .add_enabled(
-                                            !self.preset_sel.is_empty(),
-                                            egui::Button::new("Apply"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.apply_preset();
-                                    }
-                                    if ui.button("Save current").clicked() {
-                                        self.save_open = true;
-                                        self.save_name.clear();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            !self.preset_sel.is_empty(),
-                                            egui::Button::new("Delete"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.delete_preset();
-                                    }
-                                });
-                            });
                     }
                     ui.add_space(18.0);
                 });
@@ -875,40 +710,6 @@ impl eframe::App for App {
         }
         if let Some(i) = pending_menu {
             self.apply_menu(i);
-        }
-
-        // Save-preset dialog.
-        if self.save_open {
-            let mut open = self.save_open;
-            egui::Window::new("Save current look")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Give this set of display settings a name:");
-                    let name_edit = ui
-                        .add(egui::TextEdit::singleline(&mut self.save_name).desired_width(240.0));
-                    if name_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let name = self.save_name.trim().to_string();
-                        self.save_open = false;
-                        if !name.is_empty() {
-                            self.start_save_preset(name);
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            let name = self.save_name.trim().to_string();
-                            self.save_open = false;
-                            if !name.is_empty() {
-                                self.start_save_preset(name);
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.save_open = false;
-                        }
-                    });
-                });
-            self.save_open = open;
         }
 
         if let Some(err) = self.error.clone() {
@@ -925,23 +726,6 @@ impl eframe::App for App {
                 });
             if !open {
                 self.error = None;
-            }
-        }
-
-        if let Some(info) = self.info.clone() {
-            let mut open = true;
-            egui::Window::new("ddpm")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(info);
-                    if ui.button("OK").clicked() {
-                        self.info = None;
-                    }
-                });
-            if !open {
-                self.info = None;
             }
         }
 

@@ -19,7 +19,7 @@ This is the **Rust** implementation. Two binaries are built: `ddpm` (CLI) and
 | Power state (on / standby / suspend / off / hard-off), mute; OSD lock/unlock (CLI) | `get`, `set` | power/mute dropdowns |
 | Color temperature presets | `get`, `set` | dropdown |
 | Raw VCP codes | `get`/`set 0x62` | - |
-| Named presets (save snapshot, apply later) | `preset` | buttons |
+| Named presets (save snapshot, apply later) | `preset` subcommands | CLI only |
 | Backends: `ddcutil`, direct i2c (`ddcci`), `mock` for tests | `--backend` | same |
 
 ## Install
@@ -76,9 +76,9 @@ serial, or a short-name mapped with `ddpm set` in config.
 ddpm-gui                          # or: ddpm-gui --backend mock
 ```
 
-A tabbed window (eframe/egui): one tab per display, sliders for
-brightness/contrast/volume, dropdowns for input/color temp/power/mute,
-plus a preset bar (apply/save). Slow DDC/CI traffic happens on background
+A dashboard (eframe/egui) with selectable display cards, a live screen
+preview, sliders for brightness/contrast/volume, and dropdowns for input,
+color temperature, power, and mute. Slow DDC/CI traffic happens on background
 threads so the UI stays responsive.
 
 ## Presets & config
