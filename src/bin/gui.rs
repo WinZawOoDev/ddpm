@@ -584,6 +584,9 @@ impl eframe::App for App {
                                                 .color(egui::Color32::from_rgb(123, 146, 170)),
                                             );
                                         });
+                                    if i + 1 < FEATURE_LABELS.len() {
+                                        control_column.add_space(8.0);
+                                    }
                                 }
                             });
 
