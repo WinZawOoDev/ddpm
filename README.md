@@ -15,7 +15,7 @@ This is the **Rust** implementation. Two binaries are built: `ddpm` (CLI) and
 |---|---|---|
 | Enumerate displays (model, serial, bus, features) | `list`, `detect` | yes |
 | Brightness / contrast / volume (0-100) | `get`, `set` | sliders |
-| Input source (vga, dvi, dp, hdmi, usb-c...) | `get`, `set` | dropdown |
+| Input source (vga, dvi, dp, hdmi, usb-c...) | `get`, `set` | HDMI 1/2 and USB-C dropdown |
 | Power state (on / standby / suspend / off / hard-off), mute; OSD lock/unlock (CLI) | `get`, `set` | power/mute dropdowns |
 | Color temperature presets | `get`, `set` | dropdown |
 | Raw VCP codes | `get`/`set 0x62` | - |

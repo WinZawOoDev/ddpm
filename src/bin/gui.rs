@@ -20,8 +20,10 @@ const FEATURE_LABELS: [(&str, &str); 3] = [
     ("volume", "Volume"),
 ];
 
+const GUI_INPUT_VALUES: ValueTable = &[(0x11, "HDMI 1"), (0x12, "HDMI 2"), (0x1B, "USB-C")];
+
 const MENUS: [(&str, &str, ValueTable); 4] = [
-    ("input", "Input", vcp::INPUT_VALUES),
+    ("input", "Input", GUI_INPUT_VALUES),
     ("color-temp", "Color temp", vcp::COLOR_PRESET_VALUES),
     ("power", "Power", vcp::POWER_VALUES),
     ("mute", "Mute", vcp::MUTE_VALUES),
