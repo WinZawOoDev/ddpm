@@ -263,21 +263,13 @@ fn draw_display_preview(
     let bg = egui::Color32::from_rgb(18, 27, 40);
     painter.rect_filled(bounds, 10.0, bg);
 
-    painter.text(
-        bounds.min + egui::vec2(16.0, 14.0),
-        egui::Align2::LEFT_TOP,
-        "SCREEN PREVIEW",
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_rgb(128, 153, 180),
-    );
-
     let display_width = (bounds.width() * 0.64)
         .min(560.0)
         .min((bounds.width() - 32.0).max(140.0));
     let display_height = 154.0;
     let outer_size = egui::vec2(display_width + 18.0, display_height + 18.0);
     let outer = egui::Rect::from_min_size(
-        egui::pos2(bounds.center().x - outer_size.x / 2.0, bounds.top() + 35.0),
+        egui::pos2(bounds.center().x - outer_size.x / 2.0, bounds.top() + 16.0),
         outer_size,
     );
     painter.rect_filled(outer, 10.0, egui::Color32::from_rgb(48, 61, 78));
@@ -517,15 +509,6 @@ impl eframe::App for App {
                                 egui::Frame::group(preview_column.style())
                                     .fill(egui::Color32::from_rgb(17, 25, 36))
                                     .show(preview_column, |ui| {
-                                        ui.label(egui::RichText::new("Live preview").strong());
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Brightness and white point update the screen view",
-                                            )
-                                            .size(11.0)
-                                            .color(egui::Color32::from_rgb(127, 151, 177)),
-                                        );
-                                        ui.add_space(8.0);
                                         draw_display_preview(
                                             ui,
                                             ui.available_width(),
@@ -546,22 +529,35 @@ impl eframe::App for App {
                                     egui::Frame::group(control_column.style())
                                         .fill(egui::Color32::from_rgb(20, 29, 41))
                                         .show(control_column, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(FEATURE_LABELS[i].1)
-                                                    .color(egui::Color32::from_rgb(167, 188, 210)),
-                                            );
                                             let unavailable = panel.slider_texts[i] == "n/a";
                                             let value = if unavailable {
                                                 "—".to_string()
                                             } else {
                                                 format!("{}%", panel.sliders[i].round() as u16)
                                             };
-                                            ui.label(
-                                                egui::RichText::new(value)
-                                                    .size(24.0)
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(237, 245, 255)),
-                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(FEATURE_LABELS[i].1)
+                                                        .color(egui::Color32::from_rgb(
+                                                            167, 188, 210,
+                                                        )),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(value)
+                                                                .size(24.0)
+                                                                .strong()
+                                                                .color(egui::Color32::from_rgb(
+                                                                    237, 245, 255,
+                                                                )),
+                                                        );
+                                                    },
+                                                );
+                                            });
                                             let response = ui
                                                 .add_enabled_ui(!unavailable, |ui| {
                                                     ui.spacing_mut().slider_width =

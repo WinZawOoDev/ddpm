@@ -76,10 +76,14 @@ serial, or a short-name mapped with `ddpm set` in config.
 ddpm-gui                          # or: ddpm-gui --backend mock
 ```
 
-A dashboard (eframe/egui) with selectable display cards, a live screen
-preview, sliders for brightness/contrast/volume, and dropdowns for input,
-color temperature, power, and mute. Slow DDC/CI traffic happens on background
-threads so the UI stays responsive.
+A compact dashboard (eframe/egui) with selectable display cards showing each
+monitor model and I²C bus, plus a refresh control beside the cards. Its visual
+screen preview responds to brightness and color-temperature settings; it is an
+illustration, not a capture of the monitor's actual screen. Full-width sliders
+control brightness, contrast, and volume, with dropdowns for input source,
+color temperature, power, and mute. Slow DDC/CI traffic runs on background
+threads so the UI stays responsive. Preset management is available through the
+CLI only.
 
 ## Presets & config
 
